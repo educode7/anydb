@@ -1,0 +1,5 @@
+# Normalize line endings: LF on disk and in the repository, on every platform.
+* text=auto eol=lf
+
+# Generated/lock files follow the same rule; no binaries in-tree today.
+# Add dedicated rules here if binary artifacts are ever committed.
