@@ -163,6 +163,34 @@ pub struct Prepared {
     pub result_formats: Vec<i16>,
 }
 
+/// One row batch of a paged execution (DBeaver fetchSize streaming
+/// analog): every batch carries the column metadata; `suspended` reports
+/// whether the portal still holds more rows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedPage {
+    /// Cumulative column metadata; `rows` are this batch only.
+    pub result: TypedResult,
+    /// `true` while the portal must be re-executed for the next batch.
+    pub suspended: bool,
+}
+
+/// Frozen metadata of a suspended portal (valid inside its hanging
+/// implicit transaction).
+#[derive(Debug, Clone, PartialEq)]
+struct PagedPortal {
+    columns: Vec<ColumnMeta>,
+    formats: Vec<i16>,
+}
+
+/// One `Execute` response of a paged flow: the batch rows and, when
+/// final, the command tag.
+#[derive(Debug)]
+struct PageBatch {
+    rows: Vec<Vec<Option<TypedValue>>>,
+    command_tag: Option<String>,
+    suspended: bool,
+}
+
 /// Protocol 3.0 major=3 minor=0 → 196608 (standard startup since PostgreSQL 7.4).
 pub const PROTOCOL_VERSION_3: i32 = 196608;
 
@@ -280,6 +308,8 @@ pub struct Connection {
     /// Serial source for internal prepared statement names (`dbpN`), kept
     /// separate from user-provided names.
     next_statement_id: u64,
+    /// Suspended portal of an in-flight paged execution, if any.
+    paged_portal: Option<PagedPortal>,
 }
 
 /// Bound of the SQL-keyed statement cache. DBeaver ships the same default
@@ -922,6 +952,7 @@ impl Connection {
             txn_status,
             statements: StatementCache::new(STATEMENT_CACHE_MAX),
             next_statement_id: 0,
+            paged_portal: None,
         })
     }
 
@@ -1396,6 +1427,263 @@ impl Connection {
             fresh
         };
         self.run_prepared(&prepared, params).await
+    }
+
+    /// Writes `Sync` and drains until `ReadyForQuery`, capturing the
+    /// transaction status so the connection stays reusable.
+    async fn write_sync_and_drain(&mut self) -> Result<(), ConnectionError> {
+        write_message(&mut self.stream, b'S', &[]).await?;
+        loop {
+            let (tag, payload) = read_message(&mut self.stream).await?;
+            match tag {
+                b'N' | b'K' | b'S' | b'v' | b'1' | b'2' | b't' | b'T' | b'n' | b'C' | b'D' => {}
+                b'Z' => {
+                    let byte = payload.first().copied().unwrap_or(b'I');
+                    self.txn_status = status_from_byte(byte)?;
+                    return Ok(());
+                }
+                other => {
+                    return Err(ConnectionError::Protocol(format!(
+                        "unexpected message {other} while draining after Sync"
+                    )));
+                }
+            }
+        }
+    }
+
+    /// Closes the implicit transaction with `Sync` after a mid-flow error
+    /// and returns the pending error so callers propagate it with the
+    /// connection left reusable.
+    async fn sync_drain_error(&mut self, error: ConnectionError) -> ConnectionError {
+        match self.write_sync_and_drain().await {
+            Ok(()) => error,
+            // A drain failure hides the original error going forward too.
+            Err(drain) => drain,
+        }
+    }
+
+    /// Describe-first metadata phase for the unnamed statement (`Parse`,
+    /// statement `Describe`, `Flush`): returns the result columns. Errors
+    /// are closed with `Sync` and drained so the connection stays usable.
+    async fn describe_result_columns(
+        &mut self,
+        sql: &str,
+        params: &[QueryParameter],
+    ) -> Result<Vec<ColumnMeta>, ConnectionError> {
+        write_message(
+            &mut self.stream,
+            b'P',
+            &parse_message_payload("", sql, params),
+        )
+        .await?;
+        write_message(&mut self.stream, b'D', b"S\0").await?;
+        write_message(&mut self.stream, b'H', &[]).await?;
+
+        let mut columns: Vec<ColumnMeta> = Vec::new();
+        loop {
+            let (tag, payload) = read_message(&mut self.stream).await?;
+            match tag {
+                // ParseComplete, ParameterDescription.
+                b'1' | b't' => {}
+                b'T' => {
+                    columns = parse_row_description_full(&payload)?;
+                    break;
+                }
+                // NoData for statements that do not return rows.
+                b'n' => break,
+                // Notice, BackendKeyData, ParameterStatus,
+                // NegotiateProtocolVersion.
+                b'N' | b'K' | b'S' | b'v' => {}
+                b'E' => {
+                    let error = runtime_error_response(&payload);
+                    return Err(self.sync_drain_error(error).await);
+                }
+                other => {
+                    return Err(ConnectionError::Protocol(format!(
+                        "unexpected message {other} during statement describe"
+                    )));
+                }
+            }
+        }
+        Ok(columns)
+    }
+
+    /// Reads one paged batch: rows until `PortalSuspended` (`s`, the batch
+    /// is not final) or `CommandComplete` (`C`, the batch is final).
+    async fn read_page_batch(
+        &mut self,
+        columns: &[ColumnMeta],
+        formats: &[i16],
+    ) -> Result<PageBatch, ConnectionError> {
+        let mut batch = PageBatch {
+            rows: Vec::new(),
+            command_tag: None,
+            suspended: false,
+        };
+        loop {
+            let (tag, payload) = read_message(&mut self.stream).await?;
+            match tag {
+                b'2' | b'n' => {}
+                b'D' => batch
+                    .rows
+                    .push(parse_typed_data_row(&payload, columns, formats)?),
+                b'C' => {
+                    // CommandComplete is the final message of the cycle:
+                    // the portal finished, Sync follows outside the loop.
+                    batch.command_tag = Some(parse_command_tag(&payload));
+                    return Ok(batch);
+                }
+                b's' => {
+                    batch.suspended = true;
+                    return Ok(batch);
+                }
+                b'N' | b'K' | b'S' | b'v' => {}
+                b'E' => {
+                    let error = runtime_error_response(&payload);
+                    return Err(self.sync_drain_error(error).await);
+                }
+                other => {
+                    return Err(ConnectionError::Protocol(format!(
+                        "unexpected message {other} during paged execution"
+                    )));
+                }
+            }
+        }
+    }
+
+    /// Drops any suspended portal state and closes its implicit
+    /// transaction with `Sync` (a superfluous `Sync` on an already-closed
+    /// transaction is simply answered with another `ReadyForQuery`).
+    async fn close_paged_portal(&mut self) -> Result<(), ConnectionError> {
+        if self.paged_portal.take().is_some() {
+            self.write_sync_and_drain().await?;
+        }
+        Ok(())
+    }
+
+    /// Row-batched execution (DBeaver `fetchSize` streaming analog): the
+    /// first call describes, binds and executes the unnamed portal
+    /// fetching up to `limit` rows. While the portal suspends
+    /// (`PortalSuspended`), the implicit transaction stays open without
+    /// `Sync`; `query_page_continue` re-executes the same portal (no
+    /// re-Bind) for the next batch. The final batch reports
+    /// `CommandComplete` and everything closes with the last `Sync`
+    /// (connection back to idle). `limit = 0` degenerates to fetch-all
+    /// (never suspends).
+    pub async fn query_page_start(
+        &mut self,
+        sql: &str,
+        params: &[QueryParameter],
+        limit: i32,
+    ) -> Result<TypedPage, ConnectionError> {
+        if limit < 0 {
+            return Err(ConnectionError::Protocol(
+                "negative max_rows limit".to_owned(),
+            ));
+        }
+        // An abandoned suspended page commits at this extra Sync; the
+        // server answers a superfluous Sync with another ReadyForQuery.
+        self.close_paged_portal().await?;
+
+        let columns = self.describe_result_columns(sql, params).await?;
+        let formats: Vec<i16> = columns
+            .iter()
+            .map(|column| {
+                if types::binary_supported(column.oid) {
+                    1
+                } else {
+                    0
+                }
+            })
+            .collect();
+
+        write_message(
+            &mut self.stream,
+            b'B',
+            &bind_message_payload("", "", params, &formats),
+        )
+        .await?;
+        let mut execute_payload = vec![0u8];
+        execute_payload.extend_from_slice(&limit.to_be_bytes());
+        write_message(&mut self.stream, b'E', &execute_payload).await?;
+        write_message(&mut self.stream, b'H', &[]).await?;
+
+        let batch = self.read_page_batch(&columns, &formats).await?;
+        if batch.suspended {
+            self.paged_portal = Some(PagedPortal {
+                columns: columns.clone(),
+                formats,
+            });
+            return Ok(TypedPage {
+                result: TypedResult {
+                    columns,
+                    rows: batch.rows,
+                    command_tag: None,
+                    affected_rows: None,
+                },
+                suspended: true,
+            });
+        }
+
+        self.write_sync_and_drain().await?;
+        let affected_rows = batch.command_tag.as_deref().and_then(tag_affected_rows);
+        Ok(TypedPage {
+            result: TypedResult {
+                columns,
+                rows: batch.rows,
+                command_tag: batch.command_tag,
+                affected_rows,
+            },
+            suspended: false,
+        })
+    }
+
+    /// Re-executes the suspended portal (no re-Bind) for the next row
+    /// batch. Errors when no paged execution is half-open; see
+    /// `query_page_start`.
+    pub async fn query_page_continue(&mut self, limit: i32) -> Result<TypedPage, ConnectionError> {
+        if limit < 0 {
+            return Err(ConnectionError::Protocol(
+                "negative max_rows limit".to_owned(),
+            ));
+        }
+        let portal = self
+            .paged_portal
+            .clone()
+            .ok_or_else(|| ConnectionError::Protocol("no suspended portal".to_owned()))?;
+
+        let mut execute_payload = vec![0u8];
+        execute_payload.extend_from_slice(&limit.to_be_bytes());
+        write_message(&mut self.stream, b'E', &execute_payload).await?;
+        write_message(&mut self.stream, b'H', &[]).await?;
+
+        let batch = self
+            .read_page_batch(&portal.columns, &portal.formats)
+            .await?;
+        if batch.suspended {
+            return Ok(TypedPage {
+                result: TypedResult {
+                    columns: portal.columns,
+                    rows: batch.rows,
+                    command_tag: None,
+                    affected_rows: None,
+                },
+                suspended: true,
+            });
+        }
+
+        self.paged_portal = None;
+        self.write_sync_and_drain().await?;
+        let affected_rows = batch.command_tag.as_deref().and_then(tag_affected_rows);
+        Ok(TypedPage {
+            result: TypedResult {
+                columns: portal.columns,
+                rows: batch.rows,
+                command_tag: batch.command_tag,
+                affected_rows,
+            },
+            suspended: false,
+        })
     }
 
     /// Sends `Terminate` and closes the stream.

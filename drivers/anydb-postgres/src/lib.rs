@@ -112,6 +112,36 @@ impl WireDataSource {
         connection.cached_query(sql, params).await
     }
 
+    /// Starts a row-batched execution on the live connection (DBeaver
+    /// `fetchSize` streaming analog). Driver-level on purpose: portal
+    /// paging spans multiple round trips on a half-open implicit
+    /// transaction, which does not fit the one-shot recovery pipeline.
+    pub async fn query_page_start(
+        &self,
+        sql: &str,
+        params: &[QueryParameter],
+        limit: i32,
+    ) -> Result<protocol::TypedPage, ConnectionError> {
+        let mut guard = self.connection.lock().await;
+        let Some(connection) = guard.as_mut() else {
+            return Err(ConnectionError::DriverFailure);
+        };
+        connection.query_page_start(sql, params, limit).await
+    }
+
+    /// Continues the suspended portal for the next row batch; see
+    /// `query_page_start`.
+    pub async fn query_page_continue(
+        &self,
+        limit: i32,
+    ) -> Result<protocol::TypedPage, ConnectionError> {
+        let mut guard = self.connection.lock().await;
+        let Some(connection) = guard.as_mut() else {
+            return Err(ConnectionError::DriverFailure);
+        };
+        connection.query_page_continue(limit).await
+    }
+
     /// Prepares a named statement on the live connection (reusable across
     /// transactions; the `Prepared` handle is session-scoped).
     pub async fn prepare_statement(
