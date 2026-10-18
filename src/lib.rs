@@ -56,6 +56,7 @@ pub mod prelude {
     pub use anydb_connections::execution::domain::value_objects::recovery_policy::RecoveryPolicy;
     pub use anydb_connections::execution::domain::value_objects::recovery_state::RecoveryState;
     pub use anydb_connections::execution::domain::value_objects::statement_gate::StatementGate;
+    pub use anydb_shared::driver::classification::effective_classifier;
     pub use anydb_shared::driver::descriptor::DriverDescriptor;
     pub use anydb_shared::driver::io::{ConnectionProperties, NetworkHandler, NetworkHandlerKind};
     pub use anydb_shared::driver::spi::{DataSource, DataSourceMetadata, Driver, OpenRequest};
@@ -185,12 +186,20 @@ impl App {
     }
 
     fn recovery_runner(&self, container_id: &str) -> RecoveryRunner {
+        // Per-driver classification (DBeaver `discoverErrorType` analog):
+        // the container's declared driver may override the kernel mapping.
+        // A missing container falls back to the conservative default.
+        let classifier = anydb_shared::driver::classification::effective_classifier(
+            self.module
+                .container(container_id)
+                .ok()
+                .map(|state| state.driver().clone())
+                .and_then(|driver| driver.error_classifier()),
+        );
         RecoveryRunner {
             container_id: container_id.to_owned(),
             policy: self.recovery_policy,
-            classifier: Arc::new(
-                anydb_connections::execution::infrastructure::default_error_classifier::DefaultErrorClassifier,
-            ),
+            classifier,
             invalidator: Arc::new(InvalidationBridge {
                 module: Arc::downgrade(&self.module),
             }),

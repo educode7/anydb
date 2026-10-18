@@ -114,7 +114,6 @@ impl DataSource for MetadataSource {
 
     async fn close(&self) {}
 }
-
 #[tokio::test]
 async fn end_to_end_connect_execute_recover_disconnect() {
     let events = RecordingEvents::new();
@@ -166,6 +165,113 @@ async fn end_to_end_connect_execute_recover_disconnect() {
     assert!(snapshot.contains(&"ds1:AfterConnect".to_string()));
     assert!(snapshot.contains(&"ds1:AfterDisconnect".to_string()));
     assert!(opens.load(Ordering::SeqCst) >= 1);
+
+    app.shutdown().await;
+}
+
+// ---------- per-driver classifier wiring ----------
+// The classifier that mirrors the production anydb-postgres driver shape:
+// SQLSTATE in ExecutionFailed decides the recovery type.
+struct SqlstateClassifier;
+
+impl ErrorClassifier for SqlstateClassifier {
+    fn classify(&self, error: &ConnectionError) -> ErrorType {
+        match error {
+            ConnectionError::ExecutionFailed {
+                sqlstate: Some(code),
+                ..
+            } if code == "25P02" => ErrorType::TransactionAborted,
+            _ => ErrorType::default_classify(error),
+        }
+    }
+}
+
+/// Same `OkDriver` shape plus a driver-supplied classifier override.
+struct ClassifierDriver {
+    descriptor: DriverDescriptor,
+}
+
+impl ClassifierDriver {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            descriptor: DriverDescriptor::new("fake-classified", "Fake Classified", true),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl Driver for ClassifierDriver {
+    fn descriptor(&self) -> &DriverDescriptor {
+        &self.descriptor
+    }
+
+    fn error_classifier(&self) -> Option<Arc<dyn ErrorClassifier>> {
+        Some(Arc::new(SqlstateClassifier))
+    }
+
+    async fn open_data_source(
+        &self,
+        _request: OpenRequest,
+    ) -> ConnectionResult<Arc<dyn DataSource>> {
+        Ok(Arc::new(MetadataSource) as Arc<dyn DataSource>)
+    }
+}
+
+/// Drives `execute_with_recovery`: the first `failures` attempts fail with
+/// `first`/`second` SQLSTATEs (attempt 0 vs the rest), the rest succeed.
+async fn run_state_sequence(
+    app: &App,
+    container_id: &str,
+    first: &'static str,
+    second: &'static str,
+    failures: usize,
+) -> (ConnectionResult<()>, usize) {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let counter = attempts.clone();
+    let result = app
+        .execute_with_recovery(container_id, move || {
+            let attempt = counter.fetch_add(1, Ordering::SeqCst);
+            let sqlstate = if attempt == 0 { first } else { second };
+            let fut: Pin<Box<dyn Future<Output = ConnectionResult<()>> + Send>> =
+                if attempt < failures {
+                    Box::pin(async move {
+                        Err(ConnectionError::ExecutionFailed {
+                            sqlstate: Some(sqlstate.to_owned()),
+                            message: "fake".into(),
+                        })
+                    })
+                } else {
+                    Box::pin(async { Ok(()) })
+                };
+            fut
+        })
+        .await;
+    (result, attempts.load(Ordering::SeqCst))
+}
+
+#[tokio::test]
+async fn driver_classifier_feeds_the_recovery_loop() {
+    let events = RecordingEvents::new();
+    let secrets = MemorySecrets::new();
+    secrets.register("dsr1");
+    let app = App::new(secrets, events);
+    app.add_container(
+        ClassifierDriver::new(),
+        "dsr1",
+        ConnectionProperties::new("classified://host/db"),
+        vec![],
+    );
+
+    // First scenario: 25P02 (TransactionAborted) enables one retry.
+    let (result, attempts) = run_state_sequence(&app, "dsr1", "25P02", "42601", 1).await;
+    assert!(result.is_ok(), "the aborted statement must be retried");
+    assert_eq!(attempts, 2);
+
+    // Second scenario: 42601 is Normal — no retry, single attempt then the
+    // error propagates.
+    let (result, attempts) = run_state_sequence(&app, "dsr1", "42601", "42601", usize::MAX).await;
+    assert!(result.is_err(), "Normal errors must not be retried");
+    assert_eq!(attempts, 1);
 
     app.shutdown().await;
 }
