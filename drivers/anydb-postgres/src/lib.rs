@@ -98,6 +98,34 @@ impl WireDataSource {
         connection.typed_query(sql, params).await
     }
 
+    /// Prepares a named statement on the live connection (reusable across
+    /// transactions; the `Prepared` handle is session-scoped).
+    pub async fn prepare_statement(
+        &self,
+        name: &str,
+        sql: &str,
+    ) -> Result<protocol::Prepared, ConnectionError> {
+        let mut guard = self.connection.lock().await;
+        let Some(connection) = guard.as_mut() else {
+            return Err(ConnectionError::DriverFailure);
+        };
+        connection.prepare(name, sql).await
+    }
+
+    /// Runs one previously prepared statement (no re-parse, no
+    /// re-describe) with maximum reuse of the session.
+    pub async fn run_prepared(
+        &self,
+        prepared: &protocol::Prepared,
+        params: &[QueryParameter],
+    ) -> Result<protocol::TypedResult, ConnectionError> {
+        let mut guard = self.connection.lock().await;
+        let Some(connection) = guard.as_mut() else {
+            return Err(ConnectionError::DriverFailure);
+        };
+        connection.run_prepared(prepared, params).await
+    }
+
     /// Explicit `BEGIN` over the live connection.
     pub async fn begin_transaction(&self) -> Result<(), ConnectionError> {
         let mut guard = self.connection.lock().await;

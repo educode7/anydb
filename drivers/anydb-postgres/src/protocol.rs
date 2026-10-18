@@ -45,10 +45,11 @@ fn bind_param_section(params: &[QueryParameter]) -> Vec<u8> {
     payload
 }
 
-/// `Parse` payload for the unnamed statement: sql plus declared parameter
-/// type OIDs.
-fn parse_message_payload(sql: &str, params: &[QueryParameter]) -> Vec<u8> {
-    let mut parse_payload = vec![0u8];
+/// `Parse` payload for one prepared statement (named or unnamed): sql plus
+/// declared parameter type OIDs.
+fn parse_message_payload(name: &str, sql: &str, params: &[QueryParameter]) -> Vec<u8> {
+    let mut parse_payload = name.as_bytes().to_vec();
+    parse_payload.push(0);
     parse_payload.extend_from_slice(sql.as_bytes());
     parse_payload.push(0);
     parse_payload.extend_from_slice(&(params.len() as i16).to_be_bytes());
@@ -56,6 +57,28 @@ fn parse_message_payload(sql: &str, params: &[QueryParameter]) -> Vec<u8> {
         parse_payload.extend_from_slice(&param_type_oid(param).to_be_bytes());
     }
     parse_payload
+}
+
+/// `Bind` payload: portal and statement names, binary-format parameter
+/// values and the requested result formats (one per column; `0` applies to
+/// all when the list is a single text entry or the statement has no
+/// columns).
+fn bind_message_payload(
+    portal: &str,
+    statement: &str,
+    params: &[QueryParameter],
+    result_formats: &[i16],
+) -> Vec<u8> {
+    let mut payload = portal.as_bytes().to_vec();
+    payload.push(0);
+    payload.extend_from_slice(statement.as_bytes());
+    payload.push(0);
+    payload.extend(bind_param_section(params));
+    payload.extend_from_slice(&(result_formats.len() as i16).to_be_bytes());
+    for format in result_formats {
+        payload.extend_from_slice(&(*format).to_be_bytes());
+    }
+    payload
 }
 
 use crate::auth::{self, ScramClient};
@@ -121,6 +144,22 @@ pub struct TypedResult {
     pub rows: Vec<Vec<Option<TypedValue>>>,
     pub command_tag: Option<String>,
     pub affected_rows: Option<i64>,
+}
+
+/// A named prepared statement on the server (DBeaver prepared-statement
+/// reuse analog): reusable across transactions until the session ends or
+/// the name is re-`Parse`d. Valid only on connections that share the
+/// session where it was prepared.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Prepared {
+    pub name: String,
+    pub sql: String,
+    /// Server-declared parameter type OIDs (server inference applied).
+    pub param_oids: Vec<i32>,
+    /// Result columns as described at prepare time.
+    pub columns: Vec<ColumnMeta>,
+    /// Catalog-chosen binary/text result formats (stable per statement).
+    pub result_formats: Vec<i16>,
 }
 
 /// Protocol 3.0 major=3 minor=0 → 196608 (standard startup since PostgreSQL 7.4).
@@ -670,6 +709,29 @@ fn parse_row_description_full(payload: &[u8]) -> Result<Vec<ColumnMeta>, Connect
     Ok(columns)
 }
 
+/// ParameterDescription: count plus the server-declared type OID per
+/// parameter.
+fn parse_parameter_description(payload: &[u8]) -> Result<Vec<i32>, ConnectionError> {
+    if payload.len() < 2 {
+        return Err(ConnectionError::Protocol(
+            "truncated parameter description".to_owned(),
+        ));
+    }
+    let count = i16::from_be_bytes(slice2(&payload[0..2])?) as usize;
+    if payload.len() < 2 + count * 4 {
+        return Err(ConnectionError::Protocol(
+            "truncated parameter description".to_owned(),
+        ));
+    }
+    let mut oids = Vec::with_capacity(count);
+    for index in 0..count {
+        oids.push(i32::from_be_bytes(slice4(
+            &payload[2 + index * 4..6 + index * 4],
+        )?));
+    }
+    Ok(oids)
+}
+
 /// Data row with typed values: column count, then per column an i32 length
 /// (`-1` = NULL) and the value bytes in the format previously requested for
 /// that column.
@@ -882,16 +944,21 @@ impl Connection {
         params: &[QueryParameter],
     ) -> Result<ExtendedResult, ConnectionError> {
         // Parse: [name\0][sql\0][i16 param count][i32 oid per param].
-        write_message(&mut self.stream, b'P', &parse_message_payload(sql, params)).await?;
+        write_message(
+            &mut self.stream,
+            b'P',
+            &parse_message_payload("", sql, params),
+        )
+        .await?;
 
-        // Bind: [portal\0][statement\0][param formats][param values]
-        // [result formats]; every parameter is binary (1), every result is
+        // Bind: unnamed portal, every parameter binary (1), every result
         // text (0).
-        let mut bind_payload = vec![0u8, 0u8];
-        bind_payload.extend(bind_param_section(params));
-        bind_payload.extend_from_slice(&1i16.to_be_bytes());
-        bind_payload.extend_from_slice(&0i16.to_be_bytes());
-        write_message(&mut self.stream, b'B', &bind_payload).await?;
+        write_message(
+            &mut self.stream,
+            b'B',
+            &bind_message_payload("", "", params, &[0]),
+        )
+        .await?;
 
         // Describe portal: returns ParameterDescription + RowDescription
         // (or NoData for non-row statements).
@@ -969,7 +1036,12 @@ impl Connection {
         sql: &str,
         params: &[QueryParameter],
     ) -> Result<TypedResult, ConnectionError> {
-        write_message(&mut self.stream, b'P', &parse_message_payload(sql, params)).await?;
+        write_message(
+            &mut self.stream,
+            b'P',
+            &parse_message_payload("", sql, params),
+        )
+        .await?;
         write_message(&mut self.stream, b'D', b"S\0").await?;
         write_message(&mut self.stream, b'H', &[]).await?;
 
@@ -1031,14 +1103,14 @@ impl Connection {
             })
             .collect();
 
-        // Bind: every parameter binary; result formats follow the catalog.
-        let mut bind_payload = vec![0u8, 0u8];
-        bind_payload.extend(bind_param_section(params));
-        bind_payload.extend_from_slice(&(formats.len() as i16).to_be_bytes());
-        for format in &formats {
-            bind_payload.extend_from_slice(&(*format).to_be_bytes());
-        }
-        write_message(&mut self.stream, b'B', &bind_payload).await?;
+        // Bind: unnamed portal, every parameter binary, result formats
+        // following the catalog.
+        write_message(
+            &mut self.stream,
+            b'B',
+            &bind_message_payload("", "", params, &formats),
+        )
+        .await?;
 
         // Execute: all rows, no PortalSuspended path.
         let mut execute_payload = vec![0u8];
@@ -1088,6 +1160,152 @@ impl Connection {
                 other => {
                     return Err(ConnectionError::Protocol(format!(
                         "unexpected message {other} during typed query"
+                    )));
+                }
+            }
+        }
+    }
+
+    /// Prepares a named statement and captures its metadata (DBeaver
+    /// prepared-statement reuse analog): `Parse(name) -> Describe
+    /// statement(name) -> Sync`. Named statements survive transactions, so
+    /// later `Bind`/`Execute`/`Sync` cycles skip the parse entirely;
+    /// server-declared parameter OIDs and catalog-driven result formats
+    /// are stable across runs. The handle is valid only on connections
+    /// that share the session where it was prepared.
+    pub async fn prepare(&mut self, name: &str, sql: &str) -> Result<Prepared, ConnectionError> {
+        write_message(
+            &mut self.stream,
+            b'P',
+            &parse_message_payload(name, sql, &[]),
+        )
+        .await?;
+        let mut describe_payload = name.as_bytes().to_vec();
+        describe_payload.push(0);
+        write_message(&mut self.stream, b'D', &describe_payload).await?;
+        write_message(&mut self.stream, b'S', &[]).await?;
+
+        let sql_stored = sql.to_owned();
+        let mut param_oids: Vec<i32> = Vec::new();
+        let mut columns: Vec<ColumnMeta> = Vec::new();
+        let mut runtime_error: Option<ConnectionError> = None;
+        loop {
+            let (tag, payload) = read_message(&mut self.stream).await?;
+            match tag {
+                // ParseComplete.
+                b'1' => {}
+                // ParameterDescription: server-declared parameter OIDs.
+                b't' => param_oids = parse_parameter_description(&payload)?,
+                b'T' => columns = parse_row_description_full(&payload)?,
+                // NoData for statements that do not return rows.
+                b'n' => {}
+                // Notice, BackendKeyData, ParameterStatus,
+                // NegotiateProtocolVersion.
+                b'N' | b'K' | b'S' | b'v' => {}
+                b'E' => {
+                    runtime_error = Some(runtime_error_response(&payload));
+                }
+                b'Z' => {
+                    let byte = payload.first().copied().unwrap_or(b'I');
+                    self.txn_status = status_from_byte(byte)?;
+                    if let Some(error) = runtime_error {
+                        return Err(error);
+                    }
+                    // Result format per column, decided once: binary where
+                    // the catalog supports the type.
+                    let result_formats: Vec<i16> = columns
+                        .iter()
+                        .map(|column| {
+                            if types::binary_supported(column.oid) {
+                                1
+                            } else {
+                                0
+                            }
+                        })
+                        .collect();
+                    return Ok(Prepared {
+                        name: name.to_owned(),
+                        sql: sql_stored,
+                        param_oids,
+                        columns,
+                        result_formats,
+                    });
+                }
+                other => {
+                    return Err(ConnectionError::Protocol(format!(
+                        "unexpected message {other} during prepare"
+                    )));
+                }
+            }
+        }
+    }
+
+    /// Runs one previously prepared statement: `Bind(statement name) ->
+    /// Execute -> Sync`. No re-`Parse`, no re-`Describe`: the metadata
+    /// captured at prepare time drives the formats and the typed decoding.
+    pub async fn run_prepared(
+        &mut self,
+        prepared: &Prepared,
+        params: &[QueryParameter],
+    ) -> Result<TypedResult, ConnectionError> {
+        write_message(
+            &mut self.stream,
+            b'B',
+            &bind_message_payload("", &prepared.name, params, &prepared.result_formats),
+        )
+        .await?;
+
+        // Execute: all rows, no PortalSuspended path.
+        let mut execute_payload = vec![0u8];
+        execute_payload.extend_from_slice(&0i32.to_be_bytes());
+        write_message(&mut self.stream, b'E', &execute_payload).await?;
+        write_message(&mut self.stream, b'S', &[]).await?;
+
+        let mut result = TypedResult {
+            columns: prepared.columns.clone(),
+            rows: Vec::new(),
+            command_tag: None,
+            affected_rows: None,
+        };
+        let mut runtime_error: Option<ConnectionError> = None;
+        loop {
+            let (tag, payload) = read_message(&mut self.stream).await?;
+            match tag {
+                // BindComplete, ParameterDescription, ParseComplete, NoData.
+                b'2' | b'1' | b't' | b'n' => {}
+                b'D' => {
+                    let row = parse_typed_data_row(
+                        &payload,
+                        &prepared.columns,
+                        &prepared.result_formats,
+                    )?;
+                    result.rows.push(row);
+                }
+                b'C' => {
+                    result.command_tag = Some(parse_command_tag(&payload));
+                    result.affected_rows =
+                        result.command_tag.as_deref().and_then(tag_affected_rows);
+                }
+                b'N' | b'K' | b'S' | b'v' => {}
+                b'E' => {
+                    runtime_error = Some(runtime_error_response(&payload));
+                }
+                b'Z' => {
+                    let byte = payload.first().copied().unwrap_or(b'I');
+                    self.txn_status = status_from_byte(byte)?;
+                    if let Some(error) = runtime_error {
+                        return Err(error);
+                    }
+                    return Ok(result);
+                }
+                b's' => {
+                    return Err(ConnectionError::Protocol(
+                        "unexpected PortalSuspended (max_rows=0)".to_owned(),
+                    ));
+                }
+                other => {
+                    return Err(ConnectionError::Protocol(format!(
+                        "unexpected message {other} during prepared run"
                     )));
                 }
             }
