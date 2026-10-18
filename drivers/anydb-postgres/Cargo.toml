@@ -7,6 +7,12 @@ license.workspace = true
 [dependencies]
 anydb-shared.workspace = true
 async-trait.workspace = true
+tokio = { workspace = true, features = ["net", "io-util"] }
+sha2 = "0.10"
+hmac = "0.12"
+md-5 = "0.10"
+base64 = "0.22"
+rand = "0.9"
 
 [dev-dependencies]
 tokio.workspace = true

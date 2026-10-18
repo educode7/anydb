@@ -23,6 +23,10 @@ pub enum ConnectionError {
     MissingSecrets,
     #[error("network handler failure")]
     NetworkFailure,
+    #[error("protocol failure: {0}")]
+    /// Driver wire/protocol-level failure. Message detail is produced by
+    /// drivers and must never embed secrets (user/password).
+    Protocol(String),
     #[error("driver failure")]
     DriverFailure,
     #[error("operation canceled")]
