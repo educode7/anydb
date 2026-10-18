@@ -83,9 +83,9 @@ impl WireDataSource {
         connection.simple_query(sql).await
     }
 
-    /// Typed statement execution over the live connection: binary format
-    /// for cataloged column types, text for the rest. Row values come back
-    /// as shared `TypedValue`s (NULL is `None`).
+    /// Typed one-shot execution over the live connection: binary format
+    /// for cataloged column types, text for the rest (NULL is `None`).
+    /// Deliberately uncached: stable wire shape for direct wire users.
     pub async fn execute_typed_statement(
         &self,
         sql: &str,
@@ -96,6 +96,20 @@ impl WireDataSource {
             return Err(ConnectionError::DriverFailure);
         };
         connection.typed_query(sql, params).await
+    }
+
+    /// Typed execution with the SQL-keyed prepared statement cache:
+    /// first use prepares, later uses bind to the cached handle.
+    pub async fn execute_cached_statement_typed(
+        &self,
+        sql: &str,
+        params: &[QueryParameter],
+    ) -> Result<protocol::TypedResult, ConnectionError> {
+        let mut guard = self.connection.lock().await;
+        let Some(connection) = guard.as_mut() else {
+            return Err(ConnectionError::DriverFailure);
+        };
+        connection.cached_query(sql, params).await
     }
 
     /// Prepares a named statement on the live connection (reusable across
@@ -213,6 +227,20 @@ impl Driver for PostgresDriver {
     }
 }
 
+/// Maps a wire-level typed result into the driver-neutral SPI value.
+fn typed_statement_result(typed: protocol::TypedResult) -> TypedStatementResult {
+    TypedStatementResult {
+        columns: typed
+            .columns
+            .into_iter()
+            .map(|column| column.name)
+            .collect(),
+        rows: typed.rows,
+        command_tag: typed.command_tag,
+        affected_rows: typed.affected_rows,
+    }
+}
+
 #[async_trait]
 impl DataSource for WireDataSource {
     fn metadata(&self) -> DataSourceMetadata {
@@ -250,16 +278,18 @@ impl DataSource for WireDataSource {
         params: &[QueryParameter],
     ) -> Result<TypedStatementResult, ConnectionError> {
         let typed = WireDataSource::execute_typed_statement(self, sql, params).await?;
-        Ok(TypedStatementResult {
-            columns: typed
-                .columns
-                .into_iter()
-                .map(|column| column.name)
-                .collect(),
-            rows: typed.rows,
-            command_tag: typed.command_tag,
-            affected_rows: typed.affected_rows,
-        })
+        Ok(typed_statement_result(typed))
+    }
+
+    /// Cached execution: first use prepares, later uses bind to the SQL-
+    /// keyed session handle.
+    async fn execute_cached_statement_typed(
+        &self,
+        sql: &str,
+        params: &[QueryParameter],
+    ) -> Result<TypedStatementResult, ConnectionError> {
+        let typed = WireDataSource::execute_cached_statement_typed(self, sql, params).await?;
+        Ok(typed_statement_result(typed))
     }
 
     /// `ROLLBACK` over the live connection: normalizes the aborted

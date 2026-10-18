@@ -276,6 +276,121 @@ async fn driver_classifier_feeds_the_recovery_loop() {
     app.shutdown().await;
 }
 
+// ---------- cached statement execution through the pipeline ----------
+
+/// Data source with a SQL-keyed cache behavior: same abort-once contract
+/// as `TypedEchoSource`, but reached through the cached SPI method.
+struct CachedEchoSource {
+    calls: Arc<AtomicUsize>,
+    rollbacks: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl DataSource for CachedEchoSource {
+    fn metadata(&self) -> DataSourceMetadata {
+        DataSourceMetadata {
+            product_name: "Fake".into(),
+            product_version: "0".into(),
+            driver_name: "fake-cached".into(),
+        }
+    }
+
+    async fn ping(&self) -> ConnectionResult<()> {
+        Ok(())
+    }
+
+    async fn rollback_transaction(&self) -> ConnectionResult<()> {
+        self.rollbacks.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn execute_cached_statement_typed(
+        &self,
+        _sql: &str,
+        _params: &[QueryParameter],
+    ) -> ConnectionResult<TypedStatementResult> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        if call == 0 {
+            return Err(ConnectionError::ExecutionFailed {
+                sqlstate: Some("25P02".to_owned()),
+                message: "current transaction is aborted".into(),
+            });
+        }
+        Ok(TypedStatementResult {
+            columns: vec!["n".into()],
+            rows: vec![vec![Some(TypedValue::Int8(9))]],
+            command_tag: Some("SELECT 1".into()),
+            affected_rows: Some(1),
+        })
+    }
+
+    async fn close(&self) {}
+}
+
+/// Classified driver exposing the cached counting data source.
+struct CachedDriver {
+    descriptor: DriverDescriptor,
+    calls: Arc<AtomicUsize>,
+    rollbacks: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Driver for CachedDriver {
+    fn descriptor(&self) -> &DriverDescriptor {
+        &self.descriptor
+    }
+
+    fn error_classifier(&self) -> Option<Arc<dyn ErrorClassifier>> {
+        Some(Arc::new(SqlstateClassifier))
+    }
+
+    async fn open_data_source(
+        &self,
+        _request: OpenRequest,
+    ) -> ConnectionResult<Arc<dyn DataSource>> {
+        Ok(Arc::new(CachedEchoSource {
+            calls: self.calls.clone(),
+            rollbacks: self.rollbacks.clone(),
+        }) as Arc<dyn DataSource>)
+    }
+}
+
+#[tokio::test]
+async fn cached_statement_execution_routes_through_the_pipeline() {
+    let events = RecordingEvents::new();
+    let secrets = MemorySecrets::new();
+    secrets.register("dsc1");
+    let secrets_dyn: Arc<dyn SecretsStore> = secrets;
+    let events_dyn: Arc<dyn ConnectionEvents> = events.clone();
+    let app = App::new(secrets_dyn, events_dyn);
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let rollbacks = Arc::new(AtomicUsize::new(0));
+    app.add_container(
+        Arc::new(CachedDriver {
+            descriptor: DriverDescriptor::new("fake-cached", "Fake Cached", true),
+            calls: calls.clone(),
+            rollbacks: rollbacks.clone(),
+        }),
+        "dsc1",
+        ConnectionProperties::new("cached://host/db"),
+        vec![],
+    );
+
+    app.connect("dsc1").await.expect("connect ok");
+
+    // Aborted first attempt -> rollback -> retry through the cached path.
+    let result = app
+        .execute_cached_statement_typed("dsc1", "SELECT $1", &[QueryParameter::Integer(9)])
+        .await
+        .expect("cached statement must recover");
+    assert_eq!(result.rows, vec![vec![Some(TypedValue::Int8(9))]]);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(rollbacks.load(Ordering::SeqCst), 1);
+
+    app.shutdown().await;
+}
+
 // ---------- Transactions-scope invalidation runs a live rollback ----------
 
 /// Data source counting every live ROLLBACK the invalidation bridge issues.

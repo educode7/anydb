@@ -216,6 +216,34 @@ impl App {
         .await
     }
 
+    /// Cached typed statement execution (DBeaver `DBCStatement` cache
+    /// analog): same recovery semantics as `execute_statement_typed`, but
+    /// the driver consults its SQL-keyed session cache (prepare once,
+    /// bind afterwards; the cache dies with the connection). Drivers
+    /// without a cache degrade to plain typed execution.
+    pub async fn execute_cached_statement_typed(
+        &self,
+        container_id: &str,
+        sql: &str,
+        params: &[QueryParameter],
+    ) -> ConnectionResult<TypedStatementResult> {
+        self.module.container(container_id)?;
+        let source = self
+            .module
+            .container(container_id)?
+            .data_source()
+            .ok_or(ConnectionError::AlreadyDisconnected)?;
+        let sql = sql.to_owned();
+        let params: Vec<QueryParameter> = params.to_vec();
+        self.execute_with_recovery(container_id, move || {
+            let source = source.clone();
+            let sql = sql.clone();
+            let params = params.clone();
+            async move { source.execute_cached_statement_typed(&sql, &params).await }
+        })
+        .await
+    }
+
     fn recovery_runner(&self, container_id: &str) -> RecoveryRunner {
         // Per-driver classification (DBeaver `discoverErrorType` analog):
         // the container's declared driver may override the kernel mapping.

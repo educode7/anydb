@@ -77,6 +77,18 @@ pub trait DataSource: Send + Sync {
         Err(ConnectionError::DriverFailure)
     }
 
+    /// Runs one statement through the driver's SQL-keyed prepared
+    /// statement cache when supported (DBeaver `DBCStatement` cache
+    /// analog). Default: plain uncached typed execution, so the contract
+    /// degrades gracefully for drivers without session caching.
+    async fn execute_cached_statement_typed(
+        &self,
+        sql: &str,
+        params: &[QueryParameter],
+    ) -> Result<TypedStatementResult, ConnectionError> {
+        self.execute_statement_typed(sql, params).await
+    }
+
     /// Rolls back the live transaction after an abort (DBeaver invalidates
     /// transactions by running a rollback). Default: the driver does not
     /// carry transaction semantics, surfacing

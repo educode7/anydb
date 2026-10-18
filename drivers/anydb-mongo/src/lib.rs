@@ -104,4 +104,20 @@ mod tests {
             .expect_err("query-only driver must not execute statements");
         assert_eq!(error, ConnectionError::DriverFailure);
     }
+
+    #[tokio::test]
+    async fn cached_statement_execution_degrades_to_plain_typed() {
+        let driver = MongoDriver::new();
+        let request = OpenRequest {
+            container_id: "c1".into(),
+            target: "mongodb://host".into(),
+            properties: Default::default(),
+        };
+        let source = driver.open_data_source(request).await.unwrap();
+        let error = source
+            .execute_cached_statement_typed("find {}", &[])
+            .await
+            .expect_err("cache-less drivers must not execute statements");
+        assert_eq!(error, ConnectionError::DriverFailure);
+    }
 }

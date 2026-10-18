@@ -6,6 +6,7 @@
 //! `PostgresDriver`.
 
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -273,6 +274,68 @@ pub struct Connection {
     pub server_params: HashMap<String, String>,
     /// Last `ReadyForQuery` transaction status (`I`/`T`/`E`).
     txn_status: TxnStatus,
+    /// SQL-keyed prepared statement cache (per session, dies with the
+    /// connection).
+    statements: StatementCache,
+    /// Serial source for internal prepared statement names (`dbpN`), kept
+    /// separate from user-provided names.
+    next_statement_id: u64,
+}
+
+/// Bound of the SQL-keyed statement cache. DBeaver ships the same default
+/// (`maxStatements` = 200).
+const STATEMENT_CACHE_MAX: usize = 200;
+
+/// SQL-keyed prepared statement cache (DBeaver `DBCStatement` cache
+/// analog): bounded LRU. Named handles are session-scoped, so the cache
+/// dies with the connection; re-connection starts empty. Evicted handles
+/// leak server-side until the session ends (the server keeps preparing
+/// more than 200 statements only if its own catalog bound allows).
+#[derive(Debug)]
+struct StatementCache {
+    max: usize,
+    /// Least-recently-used first.
+    order: VecDeque<String>,
+    entries: HashMap<String, Prepared>,
+}
+
+impl StatementCache {
+    fn new(max: usize) -> Self {
+        Self {
+            max,
+            order: VecDeque::new(),
+            entries: HashMap::new(),
+        }
+    }
+
+    /// Returns the prepared entry for `sql`, bumping it to most recently
+    /// used.
+    fn get(&mut self, sql: &str) -> Option<Prepared> {
+        let prepared = self.entries.get(sql)?.clone();
+        if let Some(position) = self.order.iter().position(|entry| entry == sql) {
+            self.order.remove(position);
+        }
+        self.order.push_back(sql.to_owned());
+        Some(prepared)
+    }
+
+    /// Inserts the prepared entry for its own SQL, evicting the least
+    /// recently used when bound is reached.
+    fn put(&mut self, prepared: Prepared) {
+        if self.entries.contains_key(&prepared.sql)
+            && let Some(position) = self.order.iter().position(|entry| entry == &prepared.sql)
+        {
+            self.order.remove(position);
+        }
+        while self.entries.len() >= self.max {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+        self.order.push_back(prepared.sql.clone());
+        self.entries.insert(prepared.sql.clone(), prepared);
+    }
 }
 
 fn io_err() -> ConnectionError {
@@ -857,6 +920,8 @@ impl Connection {
             stream,
             server_params,
             txn_status,
+            statements: StatementCache::new(STATEMENT_CACHE_MAX),
+            next_statement_id: 0,
         })
     }
 
@@ -1312,10 +1377,72 @@ impl Connection {
         }
     }
 
+    /// SQL-keyed prepared statement cache hit path: first use prepares and
+    /// stores the named statement, later uses bind to the cached handle
+    /// directly (no re-parse). Evicted/unbound names stay server-side
+    /// until session end; on fatal errors nothing is cached.
+    pub async fn cached_query(
+        &mut self,
+        sql: &str,
+        params: &[QueryParameter],
+    ) -> Result<TypedResult, ConnectionError> {
+        let prepared = if let Some(prepared) = self.statements.get(sql) {
+            prepared
+        } else {
+            self.next_statement_id += 1;
+            let name = format!("dbp{}", self.next_statement_id);
+            let fresh = self.prepare(&name, sql).await?;
+            self.statements.put(fresh.clone());
+            fresh
+        };
+        self.run_prepared(&prepared, params).await
+    }
+
     /// Sends `Terminate` and closes the stream.
     pub async fn terminate(mut self) {
         let _ = write_message(&mut self.stream, b'X', &[]).await;
         // TlsStream carries a close_notify via shutdown; plain TCP is enough.
         let _ = tokio::io::AsyncWriteExt::shutdown(&mut self.stream).await;
+    }
+}
+
+#[cfg(test)]
+mod statement_cache_tests {
+    use super::*;
+
+    fn prepared(sql: &str) -> Prepared {
+        Prepared {
+            name: "dbp1".into(),
+            sql: sql.to_owned(),
+            param_oids: vec![],
+            columns: vec![],
+            result_formats: vec![],
+        }
+    }
+
+    #[test]
+    fn cache_evicts_the_least_recently_used_sql() {
+        let mut cache = StatementCache::new(2);
+        cache.put(prepared("SELECT a"));
+        cache.put(prepared("SELECT b"));
+        // A touch moves "SELECT a" to most-recent.
+        let touched = cache.get("SELECT a").expect("hit");
+        assert_eq!(touched.name, "dbp1");
+        // The evicted one is "SELECT b", the untouched oldest.
+        cache.put(prepared("SELECT c"));
+        assert!(cache.get("SELECT b").is_none(), "b must be evicted");
+        assert!(cache.get("SELECT a").is_some(), "the touched one survives");
+        assert!(cache.get("SELECT c").is_some());
+    }
+
+    #[test]
+    fn cache_bounded_by_max() {
+        let mut cache = StatementCache::new(2);
+        for i in 0..5 {
+            cache.put(prepared(&format!("SELECT {i}")));
+        }
+        assert_eq!(cache.entries.len(), 2);
+        assert!(cache.get("SELECT 0").is_none());
+        assert!(cache.get("SELECT 4").is_some());
     }
 }

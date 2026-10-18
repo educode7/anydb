@@ -316,6 +316,70 @@ async fn prepared_statement_runs_without_reparse() {
     server.await.expect("server task");
 }
 
+/// Cached execution: one prepare cycle (first cached call), then three
+/// Bind-only runs, same stored statement.
+async fn cached_reuse_server(mut stream: TcpStream) {
+    let len = stream.read_u32().await.expect("startup length");
+    let mut startup = vec![0u8; len as usize - 4];
+    stream.read_exact(&mut startup).await.expect("startup body");
+    authentication_ok(&mut stream).await;
+    ready_for_query(&mut stream).await;
+
+    assert_parse_named(&mut stream, "dbp1", "SELECT $1 + 1", &[]).await;
+    assert_describe_statement(&mut stream, "dbp1").await;
+    assert!(expect_tag(&mut stream, b'S').await.is_empty());
+    send(&mut stream, b'1', &[]).await;
+    send(
+        &mut stream,
+        b't',
+        &parameter_description(&[types::oid::INT8]),
+    )
+    .await;
+    send(
+        &mut stream,
+        b'T',
+        &row_description_typed(&[("sum", types::oid::INT8)]),
+    )
+    .await;
+    ready_for_query(&mut stream).await;
+
+    for input in [10i64, 20, 30] {
+        assert_prepared_run_bind(&mut stream, "dbp1", &[Some(&input.to_be_bytes())], &[1]).await;
+        assert_execute_unlimited(&mut stream).await;
+        assert!(expect_tag(&mut stream, b'S').await.is_empty());
+        send(&mut stream, b'2', &[]).await;
+        let output = input + 1;
+        send(
+            &mut stream,
+            b'D',
+            &typed_data_row(&[Some(&output.to_be_bytes())]),
+        )
+        .await;
+        send(&mut stream, b'C', b"SELECT 1\0").await;
+        ready_for_query(&mut stream).await;
+    }
+}
+
+#[tokio::test]
+async fn cached_query_prepares_once_and_runs_many() {
+    let (address, server) = spawn_backend(cached_reuse_server).await;
+    let mut connection = WireConnection::connect(&target(address))
+        .await
+        .expect("connect");
+
+    for input in [10i64, 20, 30] {
+        let result = connection
+            .cached_query("SELECT $1 + 1", &[QueryParameter::Integer(input)])
+            .await
+            .expect("cached run");
+        let expected = input + 1;
+        assert_eq!(result.rows, vec![vec![Some(TypedValue::Int8(expected))]]);
+    }
+
+    connection.terminate().await;
+    server.await.expect("server task");
+}
+
 /// A Bind against a never-prepared statement name errors with SQLSTATE
 /// 26000 and the connection stays usable: drained until Z both times.
 async fn ghost_statement_server(mut stream: TcpStream) {
