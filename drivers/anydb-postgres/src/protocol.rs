@@ -151,12 +151,35 @@ impl AsyncWrite for NetStream {
     }
 }
 
+/// Transaction status reported by `ReadyForQuery` (`I` idle, `T` inside a
+/// transaction, `E` failed transaction).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TxnStatus {
+    #[default]
+    Idle,
+    InTransaction,
+    Failed,
+}
+
+fn status_from_byte(byte: u8) -> Result<TxnStatus, ConnectionError> {
+    match byte {
+        b'I' => Ok(TxnStatus::Idle),
+        b'T' => Ok(TxnStatus::InTransaction),
+        b'E' => Ok(TxnStatus::Failed),
+        other => Err(ConnectionError::Protocol(format!(
+            "unknown transaction status {other}"
+        ))),
+    }
+}
+
 /// A live frontend connection. Single-owner by design; the data source
 /// wrapper serializes access behind a tokio mutex.
 pub struct Connection {
     stream: NetStream,
     /// `ParameterStatus` values seen during startup (`server_version`, ...).
     pub server_params: HashMap<String, String>,
+    /// Last `ReadyForQuery` transaction status (`I`/`T`/`E`).
+    txn_status: TxnStatus,
 }
 
 fn io_err() -> ConnectionError {
@@ -556,11 +579,12 @@ fn parse_data_row(payload: &[u8]) -> Result<Vec<Option<String>>, ConnectionError
 }
 
 /// Startup negotiation on an established stream: startup packet, auth
-/// exchange and parameter capture until `ReadyForQuery`.
+/// exchange, parameter capture and the initial transaction status until
+/// `ReadyForQuery`.
 async fn startup_exchange(
     stream: &mut NetStream,
     target: &PostgresTarget,
-) -> Result<HashMap<String, String>, ConnectionError> {
+) -> Result<(HashMap<String, String>, TxnStatus), ConnectionError> {
     let params: [(&str, Option<&str>); 2] = [
         ("user", Some(target.user.as_str())),
         ("database", target.database.as_deref()),
@@ -569,6 +593,8 @@ async fn startup_exchange(
 
     let mut scram: Option<ScramClient> = None;
     let mut server_params: HashMap<String, String> = HashMap::new();
+    // Definite assigned at `Z` before any read through that path.
+    let txn_status: TxnStatus;
 
     loop {
         let (tag, payload) = read_message(stream).await?;
@@ -578,7 +604,11 @@ async fn startup_exchange(
             b'E' => return Err(error_response(&payload)),
             // BackendKeyData, NoticeResponse, NegotiateProtocolVersion.
             b'K' | b'N' | b'v' => {}
-            b'Z' => return Ok(server_params),
+            b'Z' => {
+                let byte = payload.first().copied().unwrap_or(b'I');
+                txn_status = status_from_byte(byte)?;
+                return Ok((server_params, txn_status));
+            }
             other => {
                 return Err(ConnectionError::Protocol(format!(
                     "unexpected message {other} during startup"
@@ -618,10 +648,11 @@ impl Connection {
                 }
             }
         };
-        let server_params = startup_exchange(&mut stream, target).await?;
+        let (server_params, txn_status) = startup_exchange(&mut stream, target).await?;
         Ok(Self {
             stream,
             server_params,
+            txn_status,
         })
     }
 
@@ -645,7 +676,11 @@ impl Connection {
                 // CommandComplete, EmptyQueryResponse, Notice, ParameterStatus.
                 b'C' | b'I' | b'N' | b'S' => {}
                 b'E' => return Err(runtime_error_response(&payload)),
-                b'Z' => return Ok(result),
+                b'Z' => {
+                    let byte = payload.first().copied().unwrap_or(b'I');
+                    self.txn_status = status_from_byte(byte)?;
+                    return Ok(result);
+                }
                 other => {
                     return Err(ConnectionError::Protocol(format!(
                         "unexpected message {other} during query"
@@ -653,6 +688,44 @@ impl Connection {
                 }
             }
         }
+    }
+
+    /// Last `ReadyForQuery` transaction status (`I` idle, `T` in
+    /// transaction, `E` failed).
+    pub fn transaction_status(&self) -> TxnStatus {
+        self.txn_status
+    }
+
+    /// Runs one control command (`BEGIN`/`COMMIT`/`ROLLBACK`) over the
+    /// extended protocol and verifies the returned command tag.
+    async fn control_statement(&mut self, expected_tag: &str) -> Result<(), ConnectionError> {
+        let result = self.extended_query(expected_tag, &[]).await?;
+        match result.command_tag.as_deref() {
+            Some(tag) if tag.starts_with(expected_tag) => Ok(()),
+            Some(tag) => Err(ConnectionError::Protocol(format!(
+                "unexpected {expected_tag} result: {tag}"
+            ))),
+            None => Err(ConnectionError::Protocol(format!(
+                "{expected_tag} did not report a command tag"
+            ))),
+        }
+    }
+
+    /// Explicit transaction control (DBeaver transaction manager analog).
+    /// `begin` inside an active transaction only resets it: PostgreSQL
+    /// answers with a warning (`NoticeResponse`) and a fresh `BEGIN` tag.
+    pub async fn begin(&mut self) -> Result<(), ConnectionError> {
+        self.control_statement("BEGIN").await
+    }
+
+    pub async fn commit(&mut self) -> Result<(), ConnectionError> {
+        self.control_statement("COMMIT").await
+    }
+
+    /// Rolls back the current transaction. Also works in the `E` (failed)
+    /// state, normalizing the connection back to idle.
+    pub async fn rollback(&mut self) -> Result<(), ConnectionError> {
+        self.control_statement("ROLLBACK").await
     }
 
     /// Extended query protocol for one prepared statement with parameters:
@@ -741,6 +814,8 @@ impl Connection {
                     runtime_error = Some(runtime_error_response(&payload));
                 }
                 b'Z' => {
+                    let byte = payload.first().copied().unwrap_or(b'I');
+                    self.txn_status = status_from_byte(byte)?;
                     if let Some(error) = runtime_error {
                         return Err(error);
                     }

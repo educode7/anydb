@@ -81,6 +81,34 @@ impl WireDataSource {
         };
         connection.simple_query(sql).await
     }
+
+    /// Explicit `BEGIN` over the live connection.
+    pub async fn begin_transaction(&self) -> Result<(), ConnectionError> {
+        let mut guard = self.connection.lock().await;
+        let Some(connection) = guard.as_mut() else {
+            return Err(ConnectionError::DriverFailure);
+        };
+        connection.begin().await
+    }
+
+    /// Explicit `COMMIT` over the live connection.
+    pub async fn commit_transaction(&self) -> Result<(), ConnectionError> {
+        let mut guard = self.connection.lock().await;
+        let Some(connection) = guard.as_mut() else {
+            return Err(ConnectionError::DriverFailure);
+        };
+        connection.commit().await
+    }
+
+    /// `ROLLBACK` over the live connection (also normalizes the failed
+    /// transaction state back to idle).
+    pub async fn rollback_transaction(&self) -> Result<(), ConnectionError> {
+        let mut guard = self.connection.lock().await;
+        let Some(connection) = guard.as_mut() else {
+            return Err(ConnectionError::DriverFailure);
+        };
+        connection.rollback().await
+    }
 }
 
 /// Maps a wire-layer extended result onto the shared statement contract.

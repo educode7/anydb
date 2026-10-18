@@ -49,6 +49,11 @@ async fn ready_for_query<S: AsyncWrite + std::marker::Unpin>(stream: &mut S) {
     send(stream, b'Z', b"I").await;
 }
 
+/// ReadyForQuery while inside a transaction (after BEGIN).
+async fn ready_for_query_in_txn<S: AsyncWrite + std::marker::Unpin>(stream: &mut S) {
+    send(stream, b'Z', b"T").await;
+}
+
 /// ReadyForQuery in the aborted-transaction state (after a runtime error).
 async fn ready_for_query_aborted<S: AsyncWrite + std::marker::Unpin>(stream: &mut S) {
     send(stream, b'Z', b"E").await;
@@ -317,6 +322,59 @@ async fn error_then_ping_server(
     ready_for_query(&mut stream).await;
 }
 
+/// Transaction flow: BEGIN (implicit txn becomes 'T'), a failing statement
+/// ('T' -> 'E' with SQLSTATE 25P02), ROLLBACK (normalizes back to idle).
+async fn transaction_flow_server(mut stream: TcpStream) {
+    assert_eq!(
+        read_startup(&mut stream).await,
+        anydb_postgres::protocol::PROTOCOL_VERSION_3
+    );
+    authentication_ok(&mut stream).await;
+    ready_for_query(&mut stream).await;
+
+    // Cycle 1: BEGIN -> CommandComplete "BEGIN", Ready 'T'.
+    assert_parse(&mut stream, "BEGIN", &[]).await;
+    assert_bind(&mut stream, &[]).await;
+    assert_describe_portal(&mut stream).await;
+    assert_execute_unlimited(&mut stream).await;
+    assert_sync(&mut stream).await;
+    send(&mut stream, b'1', &[]).await;
+    send(&mut stream, b'2', &[]).await;
+    send(&mut stream, b't', &parameter_description(&[])).await;
+    send(&mut stream, b'n', &[]).await;
+    send(&mut stream, b'C', b"BEGIN\0").await;
+    ready_for_query_in_txn(&mut stream).await;
+
+    // Cycle 2: a statement that fails inside the transaction (25P02).
+    for _ in 0..5 {
+        let _ = read_message(&mut stream).await;
+    }
+    let mut error = Vec::new();
+    for (code, value) in [
+        ('S', "ERROR"),
+        ('C', "25P02"),
+        ('M', "current transaction is aborted"),
+    ] {
+        error.extend_from_slice(format!("{code}{value}").as_bytes());
+        error.push(0);
+    }
+    send(&mut stream, b'E', &error).await;
+    ready_for_query_aborted(&mut stream).await;
+
+    // Cycle 3: ROLLBACK back to idle.
+    assert_parse(&mut stream, "ROLLBACK", &[]).await;
+    assert_bind(&mut stream, &[]).await;
+    assert_describe_portal(&mut stream).await;
+    assert_execute_unlimited(&mut stream).await;
+    assert_sync(&mut stream).await;
+    send(&mut stream, b'1', &[]).await;
+    send(&mut stream, b'2', &[]).await;
+    send(&mut stream, b't', &parameter_description(&[])).await;
+    send(&mut stream, b'n', &[]).await;
+    send(&mut stream, b'C', b"ROLLBACK\0").await;
+    ready_for_query(&mut stream).await;
+}
+
 /// Driver-level SPI cycle: int8 parameter through execute_statement.
 async fn spi_cycle_server(mut stream: TcpStream) {
     assert_eq!(
@@ -469,6 +527,46 @@ fn sqlstate_type(error: &ConnectionError) -> anydb_shared::ErrorType {
     use anydb_postgres::classification::SqlStateClassifier;
     use anydb_shared::driver::classification::ErrorClassifier;
     SqlStateClassifier.classify(error)
+}
+
+#[tokio::test]
+async fn explicit_transaction_flow_tracks_status_transitions() {
+    let (address, server) = spawn_backend(transaction_flow_server).await;
+    let mut connection = WireConnection::connect(&target(address))
+        .await
+        .expect("connect");
+    assert_eq!(
+        connection.transaction_status(),
+        anydb_postgres::protocol::TxnStatus::Idle
+    );
+
+    connection.begin().await.expect("BEGIN");
+    assert_eq!(
+        connection.transaction_status(),
+        anydb_postgres::protocol::TxnStatus::InTransaction
+    );
+
+    let error = connection
+        .extended_query("SELECT 1", &[])
+        .await
+        .expect_err("must fail with 25P02");
+    match error {
+        ConnectionError::ExecutionFailed { sqlstate, .. } => {
+            assert_eq!(sqlstate.as_deref(), Some("25P02"));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+    assert_eq!(
+        connection.transaction_status(),
+        anydb_postgres::protocol::TxnStatus::Failed
+    );
+
+    connection.rollback().await.expect("ROLLBACK");
+    assert_eq!(
+        connection.transaction_status(),
+        anydb_postgres::protocol::TxnStatus::Idle
+    );
+    server.await.expect("server task");
 }
 
 #[tokio::test]
