@@ -359,16 +359,19 @@ fn error_response(payload: &[u8]) -> ConnectionError {
 }
 
 /// Runtime (post-startup) errors are statement execution failures, not
-/// authentication problems: everything lands in `ExecutionFailed`.
-/// TODO(error-codes): classify by the `C` field (SQLSTATE) when the pg error
-/// code map lands.
+/// authentication problems: everything lands in `ExecutionFailed` with the
+/// SQLSTATE (`C` field) attached for per-driver classification.
 fn runtime_error_response(payload: &[u8]) -> ConnectionError {
     let fields = parse_fields(payload);
+    let sqlstate = fields.get(&'C').cloned();
     let message = fields
         .get(&'M')
         .map(String::as_str)
         .unwrap_or("unknown server error");
-    ConnectionError::ExecutionFailed(message.to_owned())
+    ConnectionError::ExecutionFailed {
+        sqlstate,
+        message: message.to_owned(),
+    }
 }
 
 fn required_password(target: &PostgresTarget) -> Result<String, ConnectionError> {

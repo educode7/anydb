@@ -27,11 +27,15 @@ pub enum ConnectionError {
     /// Driver wire/protocol-level failure. Message detail is produced by
     /// drivers and must never embed secrets (user/password).
     Protocol(String),
-    #[error("statement execution failed: {0}")]
+    #[error("statement execution failed: {message}")]
     /// Server-reported statement execution error (SQL runtime failures).
-    /// Detail comes from the server error response and must not embed
-    /// secrets (user/password).
-    ExecutionFailed(String),
+    /// `sqlstate` carries the driver-native error code when the server
+    /// provides one (PostgreSQL: the `C` field SQLSTATE). Neither field
+    /// must embed secrets (user/password).
+    ExecutionFailed {
+        sqlstate: Option<String>,
+        message: String,
+    },
     #[error("driver failure")]
     DriverFailure,
     #[error("operation canceled")]

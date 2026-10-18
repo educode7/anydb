@@ -7,6 +7,7 @@
 // `pub` modules: driver tests act as a server side (they recompute md5/scram
 // credentials), and advanced tooling can drive the wire layer directly.
 pub mod auth;
+pub mod classification;
 pub mod protocol;
 pub mod url;
 
@@ -123,6 +124,13 @@ fn resolve_target(request: &OpenRequest) -> Result<PostgresTarget, ConnectionErr
 impl Driver for PostgresDriver {
     fn descriptor(&self) -> &DriverDescriptor {
         &self.descriptor
+    }
+
+    /// SQLSTATE-driven classification feeding the recovery loop.
+    fn error_classifier(
+        &self,
+    ) -> Option<Arc<dyn anydb_shared::driver::classification::ErrorClassifier>> {
+        Some(Arc::new(classification::SqlStateClassifier))
     }
 
     async fn open_data_source(

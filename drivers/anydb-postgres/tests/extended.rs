@@ -281,9 +281,14 @@ async fn update_cycle_server(mut stream: TcpStream) {
     ready_for_query(&mut stream).await;
 }
 
-/// One failing cycle (server-side relation missing) followed by a ping: the
-/// client must surface ExecutionFailed AND keep the connection usable.
-async fn error_then_ping_server(mut stream: TcpStream) {
+/// One failing cycle (server-side SQLSTATE + message) followed by a ping:
+/// the client must surface ExecutionFailed (with the code) AND keep the
+/// connection usable.
+async fn error_then_ping_server(
+    mut stream: TcpStream,
+    sqlstate: &'static str,
+    message: &'static str,
+) {
     assert_eq!(
         read_startup(&mut stream).await,
         anydb_postgres::protocol::PROTOCOL_VERSION_3
@@ -295,11 +300,7 @@ async fn error_then_ping_server(mut stream: TcpStream) {
         let _ = read_message(&mut stream).await;
     }
     let mut error = Vec::new();
-    for (code, value) in [
-        ('S', "ERROR"),
-        ('C', "42P10"),
-        ('M', "relation \"missing\" does not exist"),
-    ] {
+    for (code, value) in [('S', "ERROR"), ('C', sqlstate), ('M', message)] {
         error.extend_from_slice(format!("{code}{value}").as_bytes());
         error.push(0);
     }
@@ -411,7 +412,10 @@ async fn extended_query_reports_affected_rows_for_updates() {
 
 #[tokio::test]
 async fn runtime_errors_map_to_execution_failed_and_connection_stays_reusable() {
-    let (address, server) = spawn_backend(error_then_ping_server).await;
+    let (address, server) = spawn_backend(|stream| {
+        error_then_ping_server(stream, "42P10", "relation \"missing\" does not exist")
+    })
+    .await;
     let mut connection = WireConnection::connect(&target(address))
         .await
         .expect("connect");
@@ -419,14 +423,52 @@ async fn runtime_errors_map_to_execution_failed_and_connection_stays_reusable() 
         .extended_query("SELECT * FROM missing", &[])
         .await
         .expect_err("must fail");
+    // SQLSTATE rides along for classification (42P10 from the backend).
     assert_eq!(
         error,
-        ConnectionError::ExecutionFailed("relation \"missing\" does not exist".to_owned())
+        ConnectionError::ExecutionFailed {
+            sqlstate: Some("42P10".to_owned()),
+            message: "relation \"missing\" does not exist".to_owned(),
+        }
     );
+    // Pipeline classification: syntax-class codes must NOT trigger recovery.
+    assert_eq!(sqlstate_type(&error), anydb_shared::ErrorType::Normal);
     // The failed cycle completed its drain up to ReadyForQuery: the next
     // statement on the same connection works.
     connection.simple_query("").await.expect("ping after error");
     server.await.expect("server task");
+}
+
+#[tokio::test]
+async fn aborted_transaction_sqlstate_classifies_for_recovery() {
+    let (address, server) = spawn_backend(|stream| {
+        error_then_ping_server(
+            stream,
+            "25P02",
+            "current transaction is aborted, commands ignored until end of transaction block",
+        )
+    })
+    .await;
+    let mut connection = WireConnection::connect(&target(address))
+        .await
+        .expect("connect");
+    let error = connection
+        .extended_query("SELECT 1", &[])
+        .await
+        .expect_err("must fail");
+    assert_eq!(
+        sqlstate_type(&error),
+        anydb_shared::ErrorType::TransactionAborted
+    );
+    connection.simple_query("").await.expect("ping after abort");
+    server.await.expect("server task");
+}
+
+/// Driver-supplied classifier plumbing (the recovery loop consumes this).
+fn sqlstate_type(error: &ConnectionError) -> anydb_shared::ErrorType {
+    use anydb_postgres::classification::SqlStateClassifier;
+    use anydb_shared::driver::classification::ErrorClassifier;
+    SqlStateClassifier.classify(error)
 }
 
 #[tokio::test]
