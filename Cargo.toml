@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "shared",
+    "systems/connections",
+    "drivers/anydb-postgres",
+    "drivers/anydb-mongo",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+anydb-shared = { path = "shared" }
+anydb-connections = { path = "systems/connections" }
+async-trait = "0.1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tracing = "0.1"
+
+[package]
+name = "anydb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anydb-shared.workspace = true
+anydb-connections.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"

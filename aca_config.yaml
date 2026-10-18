@@ -1,0 +1,26 @@
+project: anydb
+type: library
+language: rust
+edition: "2024"
+systems:
+  - system: connections
+    modules:
+      - connection
+      - execution
+drivers:
+  - anydb-postgres
+  - anydb-mongo
+api: none
+api_note: >
+  Library surface: the composition root crate `anydb` exposes a prelude.
+  Runtime semver, not a `/api/vN` router.
+tooling:
+  fmt: true
+  clippy_deny_warnings: true
+  cargo_audit: best_effort
+  cargo_deny: best_effort
+deviations:
+  - "Statement serialization lives in domain as a concrete enum + tokio primitive: an
+     owned async lock guard cannot be abstracted behind a dyn-safe trait."
+  - "No presentation layer: this is a library, not an HTTP service. Payload auth,
+     OWASP middleware and versioned routers do not apply."
