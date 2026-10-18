@@ -7,15 +7,20 @@ license.workspace = true
 [dependencies]
 anydb-shared.workspace = true
 async-trait.workspace = true
-tokio = { workspace = true, features = ["net", "io-util"] }
+tokio = { workspace = true, features = ["net", "io-util", "fs", "rt"] }
 sha2 = "0.10"
 hmac = "0.12"
 md-5 = "0.10"
 base64 = "0.22"
 rand = "0.9"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
+rustls-pki-types = "1"
 
 [dev-dependencies]
 tokio.workspace = true
+rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
 
 [lints.rust]
 unsafe_code = "forbid"

@@ -1,8 +1,33 @@
 //! Target URL parsing: `postgres[ql]://[user[:password]@]host[:port][/database]`.
 //! Hand-rolled to keep the driver light; percent-encoding is not supported
-//! in v0 (documented limitation).
+//! in v0 (documented limitation). TLS policy lives in the resolved settings
+//! (`ssl_mode` / `ssl_root_cert`), not in the URL.
 
 use anydb_shared::ConnectionError;
+
+/// TLS policy for the connection (libpq `sslmode` analog at three levels).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SslMode {
+    /// Plain TCP, no SSLRequest (default; back-compat with v0).
+    #[default]
+    Disable,
+    /// Try SSLRequest; fall back to plaintext if the server answers `N`.
+    Prefer,
+    /// SSL is mandatory; a `N` answer is a hard failure. Certificates are
+    /// always verified (OS roots or `ssl_root_cert`); no insecure mode.
+    Require,
+}
+
+impl SslMode {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "disable" => Some(Self::Disable),
+            "prefer" => Some(Self::Prefer),
+            "require" => Some(Self::Require),
+            _ => None,
+        }
+    }
+}
 
 /// Everything the wire protocol client needs to reach one server.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12,9 +37,26 @@ pub struct PostgresTarget {
     pub user: String,
     pub password: Option<String>,
     pub database: Option<String>,
+    pub ssl_mode: SslMode,
+    /// Optional PEM file with extra trust anchors; overrides OS roots.
+    pub ssl_root_cert: Option<String>,
 }
 
 pub const DEFAULT_PORT: u16 = 5432;
+
+impl PostgresTarget {
+    fn plain(host: String, port: u16, user: String, password: Option<String>, database: Option<String>) -> Self {
+        Self {
+            host,
+            port,
+            user,
+            password,
+            database,
+            ssl_mode: SslMode::default(),
+            ssl_root_cert: None,
+        }
+    }
+}
 
 pub fn parse_target(
     target: &str,
@@ -80,13 +122,7 @@ pub fn parse_target(
         ));
     }
 
-    Ok(PostgresTarget {
-        host,
-        port,
-        user,
-        password,
-        database,
-    })
+    Ok(PostgresTarget::plain(host, port, user, password, database))
 }
 
 #[cfg(test)]
@@ -118,5 +154,14 @@ mod tests {
         assert!(parse_target("postgres://h:notaport/db", Some("u")).is_err());
         assert!(parse_target("postgres://h/db", None).is_err());
         assert!(parse_target("postgres://", Some("u")).is_err());
+    }
+
+    #[test]
+    fn ssl_mode_parsing() {
+        assert_eq!(SslMode::parse("disable"), Some(SslMode::Disable));
+        assert_eq!(SslMode::parse("prefer"), Some(SslMode::Prefer));
+        assert_eq!(SslMode::parse("require"), Some(SslMode::Require));
+        assert_eq!(SslMode::parse("bogus"), None);
+        assert_eq!(SslMode::default(), SslMode::Disable);
     }
 }

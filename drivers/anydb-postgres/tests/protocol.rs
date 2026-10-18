@@ -13,7 +13,7 @@ use tokio::net::{TcpListener, TcpStream};
 use anydb_postgres::PostgresDriver;
 use anydb_postgres::auth::{md5_password, pbkdf2_hmac_sha256};
 use anydb_postgres::protocol::PROTOCOL_VERSION_3;
-use anydb_postgres::url::PostgresTarget;
+use anydb_postgres::url::{PostgresTarget, SslMode};
 use anydb_shared::ConnectionError;
 use anydb_shared::driver::spi::{Driver, OpenRequest};
 
@@ -81,6 +81,8 @@ fn target_for(address: std::net::SocketAddr, password: Option<&str>) -> Postgres
         user: "user".to_owned(),
         password: password.map(str::to_owned),
         database: Some("db".to_owned()),
+        ssl_mode: SslMode::default(),
+        ssl_root_cert: None,
     }
 }
 

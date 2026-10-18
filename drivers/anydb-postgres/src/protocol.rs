@@ -1,21 +1,34 @@
 //! PostgreSQL frontend protocol v3: startup, authentication exchange
-//! (trust / cleartext / md5 / SCRAM-SHA-256) and the simple query protocol.
+//! (trust / cleartext / md5 / SCRAM-SHA-256), TLS upgrade (SSLRequest then
+//! rustls handshake) and the simple query protocol.
 //!
 //! `pub` for driver tests and advanced tooling; typical users go through
 //! `PostgresDriver`.
 
 use std::collections::HashMap;
+use std::io;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::Poll;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio_rustls::TlsConnector;
+
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, ServerName};
+use rustls::{ClientConfig, RootCertStore};
 
 use anydb_shared::ConnectionError;
 
 use crate::auth::{self, ScramClient};
-use crate::url::PostgresTarget;
+use crate::url::{PostgresTarget, SslMode};
 
 /// Protocol 3.0 major=3 minor=0 → 196608 (standard startup since PostgreSQL 7.4).
 pub const PROTOCOL_VERSION_3: i32 = 196608;
+
+/// SSLRequest magic code (PostgreSQL docs, "SSL Protocol Version Number").
+pub const SSL_REQUEST_CODE: i32 = 80877103;
 
 /// One simple-query result: column names plus text-format values.
 pub struct QueryResult {
@@ -23,10 +36,80 @@ pub struct QueryResult {
     pub rows: Vec<Vec<Option<String>>>,
 }
 
+/// Transport-agnostic stream: plaintext TCP or a completed TLS 1.x session.
+pub enum NetStream {
+    Plain(TcpStream),
+    Tls(tokio_rustls::client::TlsStream<TcpStream>),
+}
+
+impl AsyncRead for NetStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match &mut *self {
+            Self::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
+            Self::Tls(stream) => Pin::new(stream).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for NetStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, io::Error>> {
+        match &mut *self {
+            Self::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
+            Self::Tls(stream) => Pin::new(stream).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<Result<usize, io::Error>> {
+        match &mut *self {
+            Self::Plain(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
+            Self::Tls(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            Self::Plain(stream) => stream.is_write_vectored(),
+            Self::Tls(stream) => stream.is_write_vectored(),
+        }
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<(), io::Error>> {
+        match &mut *self {
+            Self::Plain(stream) => Pin::new(stream).poll_flush(cx),
+            Self::Tls(stream) => Pin::new(stream).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<(), io::Error>> {
+        match &mut *self {
+            Self::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
+            Self::Tls(stream) => Pin::new(stream).poll_shutdown(cx),
+        }
+    }
+}
+
 /// A live frontend connection. Single-owner by design; the data source
 /// wrapper serializes access behind a tokio mutex.
 pub struct Connection {
-    stream: TcpStream,
+    stream: NetStream,
     /// `ParameterStatus` values seen during startup (`server_version`, ...).
     pub server_params: HashMap<String, String>,
 }
@@ -47,28 +130,46 @@ fn slice2(payload: &[u8]) -> Result<[u8; 2], ConnectionError> {
         .map_err(|_| ConnectionError::Protocol("truncated 16-bit field".to_owned()))
 }
 
+async fn read_exact<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    buf: &mut [u8],
+) -> Result<(), ConnectionError> {
+    stream
+        .read_exact(buf)
+        .await
+        .map(|_| ())
+        .map_err(|_| io_err())
+}
+
 /// Reads one backend message; the length prefix (which counts itself) is
 /// consumed and validated.
-async fn read_message(stream: &mut TcpStream) -> Result<(u8, Vec<u8>), ConnectionError> {
+async fn read_message<S: AsyncRead + Unpin>(stream: &mut S) -> Result<(u8, Vec<u8>), ConnectionError> {
     let mut tag = [0u8; 1];
-    stream.read_exact(&mut tag).await.map_err(|_| io_err())?;
-    let len = stream.read_i32().await.map_err(|_| io_err())?;
+    read_exact(stream, &mut tag).await?;
+    let mut length = [0u8; 4];
+    read_exact(stream, &mut length).await?;
+    let len = i32::from_be_bytes(length);
     if len < 4 {
         return Err(ConnectionError::Protocol(format!(
             "invalid message length {len}"
         )));
     }
     let mut payload = vec![0u8; (len - 4) as usize];
-    stream
-        .read_exact(&mut payload)
-        .await
-        .map_err(|_| io_err())?;
+    read_exact(stream, &mut payload).await?;
     Ok((tag[0], payload))
 }
 
+async fn write_all<S: AsyncWrite + Unpin>(stream: &mut S, bytes: &[u8]) -> Result<(), ConnectionError> {
+    stream
+        .write_all(bytes)
+        .await
+        .map_err(|_| io_err())?;
+    stream.flush().await.map_err(|_| io_err())
+}
+
 /// Writes one frontend message: `[tag][len][payload]`, len includes itself.
-async fn write_message(
-    stream: &mut TcpStream,
+async fn write_message<S: AsyncWrite + Unpin>(
+    stream: &mut S,
     tag: u8,
     payload: &[u8],
 ) -> Result<(), ConnectionError> {
@@ -76,14 +177,13 @@ async fn write_message(
     frame.push(tag);
     frame.extend_from_slice(&(payload.len() as i32 + 4).to_be_bytes());
     frame.extend_from_slice(payload);
-    stream.write_all(&frame).await.map_err(|_| io_err())?;
-    stream.flush().await.map_err(|_| io_err())
+    write_all(stream, &frame).await
 }
 
 /// Writes the startup packet (no tag byte: the only frontend message without
-/// one). SSLRequest is intentionally not sent in v0 (plaintext, documented).
-async fn write_startup(
-    stream: &mut TcpStream,
+/// one besides SSLRequest).
+async fn write_startup<S: AsyncWrite + Unpin>(
+    stream: &mut S,
     params: &[(&str, Option<&str>)],
 ) -> Result<(), ConnectionError> {
     let mut payload = Vec::new();
@@ -99,8 +199,79 @@ async fn write_startup(
     let mut frame = Vec::with_capacity(payload.len() + 4);
     frame.extend_from_slice(&(payload.len() as i32 + 4).to_be_bytes());
     frame.extend_from_slice(&payload);
-    stream.write_all(&frame).await.map_err(|_| io_err())?;
-    stream.flush().await.map_err(|_| io_err())
+    write_all(stream, &frame).await
+}
+
+/// SSLRequest: `[len=8][code]`, no tag byte; the server answers either
+/// 'S' (proceed with TLS) or 'N' (plaintext only).
+async fn write_ssl_request(stream: &mut TcpStream) -> Result<(), ConnectionError> {
+    let mut frame = [0u8; 8];
+    frame[0..4].copy_from_slice(&8i32.to_be_bytes());
+    frame[4..8].copy_from_slice(&SSL_REQUEST_CODE.to_be_bytes());
+    write_all(stream, &frame).await
+}
+
+/// Builds the rustls client config: OS roots by default, PEM file override
+/// with `ssl_root_cert`. Certificate verification is always on.
+fn tls_client_config(target: &PostgresTarget) -> Result<Arc<ClientConfig>, ConnectionError> {
+    let mut roots = RootCertStore::empty();
+    match &target.ssl_root_cert {
+        Some(path) => {
+            let pem_iter = CertificateDer::pem_file_iter(path).map_err(|_| {
+                ConnectionError::Protocol(format!("cannot read ssl_root_cert file: {path}"))
+            })?;
+            let mut loaded = 0usize;
+            for cert in pem_iter {
+                let cert = cert.map_err(|_| {
+                    ConnectionError::Protocol(format!("invalid PEM certificate in {path}"))
+                })?;
+                roots.add_parsable_certificates([cert]);
+                loaded += 1;
+            }
+            if loaded == 0 || roots.is_empty() {
+                return Err(ConnectionError::Protocol(format!(
+                    "no usable root certificates in {path}"
+                )));
+            }
+        }
+        None => {
+            // OS trust store; `CertificateResult` reports load errors inline.
+            let native = rustls_native_certs::load_native_certs();
+            if !native.errors.is_empty() {
+                return Err(ConnectionError::Protocol(format!(
+                    "cannot load native root certificates: {}",
+                    native.errors[0]
+                )));
+            }
+            if native.certs.is_empty() {
+                return Err(ConnectionError::Protocol(
+                    "no trusted root certificates available in the OS store".to_owned(),
+                ));
+            }
+            roots.add_parsable_certificates(native.certs);
+        }
+    }
+
+    let builder = ClientConfig::builder_with_provider(rustls::crypto::ring::default_provider().into())
+        .with_safe_default_protocol_versions()
+        .map_err(|_| ConnectionError::Protocol("TLS protocol versions unavailable".to_owned()))?;
+    let config = builder
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(Arc::new(config))
+}
+
+/// SSLRequest + TLS handshake. Always full certificate verification.
+async fn tls_upgrade(stream: TcpStream, target: &PostgresTarget) -> Result<NetStream, ConnectionError> {
+    let connector = TlsConnector::from(tls_client_config(target)?);
+    let server_name = ServerName::try_from(target.host.clone()).map_err(|_| {
+        ConnectionError::Protocol(format!("invalid TLS server name: {}", target.host))
+    })?;
+    let tls_stream = connector
+        .connect(server_name, stream)
+        .await
+        .map_err(|error| ConnectionError::Protocol(format!("TLS handshake failed: {error}")))?;
+    Ok(NetStream::Tls(tls_stream))
 }
 
 /// Parses an `ErrorResponse`/`NoticeResponse` payload: repeated
@@ -137,7 +308,10 @@ fn error_response(payload: &[u8]) -> ConnectionError {
 }
 
 fn required_password(target: &PostgresTarget) -> Result<String, ConnectionError> {
-    target.password.clone().ok_or(ConnectionError::AuthFailed)
+    target
+        .password
+        .clone()
+        .ok_or(ConnectionError::AuthFailed)
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
@@ -146,8 +320,8 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|window| window == needle)
 }
 
-async fn handle_auth(
-    stream: &mut TcpStream,
+async fn handle_auth<S: AsyncWrite + Unpin>(
+    stream: &mut S,
     payload: &[u8],
     target: &PostgresTarget,
     scram: &mut Option<ScramClient>,
@@ -211,7 +385,9 @@ async fn handle_auth(
         12 => {
             // AuthenticationSASLFinal: server-final-message data.
             let Some(client) = scram.as_ref() else {
-                return Err(ConnectionError::Protocol("unexpected SASLFinal".to_owned()));
+                return Err(ConnectionError::Protocol(
+                    "unexpected SASLFinal".to_owned(),
+                ));
             };
             client.verify_server_final(&payload[4..])?;
         }
@@ -299,44 +475,76 @@ fn parse_data_row(payload: &[u8]) -> Result<Vec<Option<String>>, ConnectionError
     Ok(values)
 }
 
+/// Startup negotiation on an established stream: startup packet, auth
+/// exchange and parameter capture until `ReadyForQuery`.
+async fn startup_exchange(
+    stream: &mut NetStream,
+    target: &PostgresTarget,
+) -> Result<HashMap<String, String>, ConnectionError> {
+    let params: [(&str, Option<&str>); 2] = [
+        ("user", Some(target.user.as_str())),
+        ("database", target.database.as_deref()),
+    ];
+    write_startup(stream, &params).await?;
+
+    let mut scram: Option<ScramClient> = None;
+    let mut server_params: HashMap<String, String> = HashMap::new();
+
+    loop {
+        let (tag, payload) = read_message(stream).await?;
+        match tag {
+            b'R' => handle_auth(stream, &payload, target, &mut scram).await?,
+            b'S' => apply_parameter_status(&mut server_params, &payload),
+            b'E' => return Err(error_response(&payload)),
+            // BackendKeyData, NoticeResponse, NegotiateProtocolVersion.
+            b'K' | b'N' | b'v' => {}
+            b'Z' => return Ok(server_params),
+            other => {
+                return Err(ConnectionError::Protocol(format!(
+                    "unexpected message {other} during startup"
+                )));
+            }
+        }
+    }
+}
+
 impl Connection {
-    /// Dials, runs the startup exchange and authenticates, returning the
-    /// live connection once `ReadyForQuery` arrives.
+    /// Dials, negotiates TLS per `ssl_mode`, runs the startup exchange and
+    /// authenticates, returning the live connection once `ReadyForQuery`.
     pub async fn connect(target: &PostgresTarget) -> Result<Self, ConnectionError> {
-        let mut stream = TcpStream::connect((target.host.as_str(), target.port))
+        let mut tcp = TcpStream::connect((target.host.as_str(), target.port))
             .await
             .map_err(|_| io_err())?;
 
-        let params: [(&str, Option<&str>); 2] = [
-            ("user", Some(target.user.as_str())),
-            ("database", target.database.as_deref()),
-        ];
-        write_startup(&mut stream, &params).await?;
-
-        let mut scram: Option<ScramClient> = None;
-        let mut server_params: HashMap<String, String> = HashMap::new();
-
-        loop {
-            let (tag, payload) = read_message(&mut stream).await?;
-            match tag {
-                b'R' => handle_auth(&mut stream, &payload, target, &mut scram).await?,
-                b'S' => apply_parameter_status(&mut server_params, &payload),
-                b'E' => return Err(error_response(&payload)),
-                // BackendKeyData, NoticeResponse, NegotiateProtocolVersion.
-                b'K' | b'N' | b'v' => {}
-                b'Z' => {
-                    return Ok(Self {
-                        stream,
-                        server_params,
-                    });
-                }
-                other => {
-                    return Err(ConnectionError::Protocol(format!(
-                        "unexpected message {other} during startup"
-                    )));
+        let mut stream = match target.ssl_mode {
+            SslMode::Disable => NetStream::Plain(tcp),
+            SslMode::Prefer | SslMode::Require => {
+                write_ssl_request(&mut tcp).await?;
+                let mut answer = [0u8; 1];
+                read_exact(&mut tcp, &mut answer).await?;
+                match (answer[0], target.ssl_mode) {
+                    (b'S', SslMode::Prefer | SslMode::Require) => {
+                        tls_upgrade(tcp, target).await?
+                    }
+                    (b'N', SslMode::Prefer) => NetStream::Plain(tcp),
+                    (b'N', _) => {
+                        return Err(ConnectionError::Protocol(
+                            "server does not support SSL (ssl_mode=require)".to_owned(),
+                        ));
+                    }
+                    (other, _) => {
+                        return Err(ConnectionError::Protocol(format!(
+                            "invalid SSLRequest answer {other}"
+                        )));
+                    }
                 }
             }
-        }
+        };
+        let server_params = startup_exchange(&mut stream, target).await?;
+        Ok(Self {
+            stream,
+            server_params,
+        })
     }
 
     /// Simple query protocol (`Query`). Rows are text-format strings; NULL is
@@ -369,8 +577,10 @@ impl Connection {
         }
     }
 
-    /// Sends `Terminate` and closes the TCP stream.
+    /// Sends `Terminate` and closes the stream.
     pub async fn terminate(mut self) {
         let _ = write_message(&mut self.stream, b'X', &[]).await;
+        // TlsStream carries a close_notify via shutdown; plain TCP is enough.
+        let _ = tokio::io::AsyncWriteExt::shutdown(&mut self.stream).await;
     }
 }

@@ -20,7 +20,7 @@ use anydb_shared::driver::descriptor::DriverDescriptor;
 use anydb_shared::driver::spi::{DataSource, DataSourceMetadata, Driver, OpenRequest};
 
 use crate::protocol::Connection as WireConnection;
-use crate::url::{PostgresTarget, parse_target};
+use crate::url::{PostgresTarget, SslMode, parse_target};
 
 #[derive(Debug)]
 pub struct PostgresDriver {
@@ -82,7 +82,8 @@ impl WireDataSource {
 }
 
 /// URL-embedded credentials are overridden by resolved properties (the
-/// secrets pipeline writes there).
+/// secrets pipeline writes there). TLS policy comes from `ssl_mode` /
+/// `ssl_root_cert` settings.
 fn resolve_target(request: &OpenRequest) -> Result<PostgresTarget, ConnectionError> {
     let user = request.properties.get("user").map(String::as_str);
     let mut target = parse_target(&request.target, user)?;
@@ -91,6 +92,16 @@ fn resolve_target(request: &OpenRequest) -> Result<PostgresTarget, ConnectionErr
     }
     if let Some(value) = request.properties.get("database") {
         target.database = Some(value.clone());
+    }
+    if let Some(value) = request.properties.get("ssl_mode") {
+        target.ssl_mode = SslMode::parse(value).ok_or_else(|| {
+            ConnectionError::Protocol(format!(
+                "invalid ssl_mode '{value}' (expected disable|prefer|require)"
+            ))
+        })?;
+    }
+    if let Some(value) = request.properties.get("ssl_root_cert") {
+        target.ssl_root_cert = Some(value.clone());
     }
     Ok(target)
 }
