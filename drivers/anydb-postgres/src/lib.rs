@@ -18,6 +18,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use anydb_shared::ConnectionError;
 use anydb_shared::driver::descriptor::DriverDescriptor;
 use anydb_shared::driver::spi::{DataSource, DataSourceMetadata, Driver, OpenRequest};
+use anydb_shared::driver::statement::{QueryParameter, StatementResult};
 
 use crate::protocol::Connection as WireConnection;
 use crate::url::{PostgresTarget, SslMode, parse_target};
@@ -81,6 +82,18 @@ impl WireDataSource {
     }
 }
 
+/// Maps a wire-layer extended result onto the shared statement contract.
+fn statement_result(
+    result: crate::protocol::ExtendedResult,
+) -> anydb_shared::driver::statement::StatementResult {
+    anydb_shared::driver::statement::StatementResult {
+        columns: result.columns,
+        rows: result.rows,
+        command_tag: result.command_tag,
+        affected_rows: result.affected_rows,
+    }
+}
+
 /// URL-embedded credentials are overridden by resolved properties (the
 /// secrets pipeline writes there). TLS policy comes from `ssl_mode` /
 /// `ssl_root_cert` settings.
@@ -130,6 +143,23 @@ impl DataSource for WireDataSource {
     /// then `ReadyForQuery`).
     async fn ping(&self) -> Result<(), ConnectionError> {
         self.simple_query("").await.map(|_| ())
+    }
+
+    /// Extended protocol execution: unnamed statement + portal with
+    /// binary-format parameters, text-format results.
+    async fn execute_statement(
+        &self,
+        sql: &str,
+        params: &[QueryParameter],
+    ) -> Result<StatementResult, ConnectionError> {
+        let mut guard = self.connection.lock().await;
+        let Some(connection) = guard.as_mut() else {
+            return Err(ConnectionError::DriverFailure);
+        };
+        connection
+            .extended_query(sql, params)
+            .await
+            .map(statement_result)
     }
 
     async fn close(&self) {

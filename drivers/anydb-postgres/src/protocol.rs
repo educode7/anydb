@@ -20,9 +20,53 @@ use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, RootCertStore};
 
 use anydb_shared::ConnectionError;
+use anydb_shared::driver::statement::QueryParameter;
 
 use crate::auth::{self, ScramClient};
 use crate::url::{PostgresTarget, SslMode};
+
+/// Postgres type OIDs for the SPI parameter set (binary-format encoding).
+const OID_BOOL: i32 = 16;
+const OID_INT8: i32 = 20;
+const OID_BYTEA: i32 = 17;
+const OID_TEXT: i32 = 25;
+const OID_FLOAT8: i32 = 701;
+
+/// Declared type OID for one SPI parameter (`0` = unknown: only NULL uses
+/// this, letting the server infer the type from the statement context).
+fn param_type_oid(param: &QueryParameter) -> i32 {
+    match param {
+        QueryParameter::Null => 0,
+        QueryParameter::Boolean(_) => OID_BOOL,
+        QueryParameter::Integer(_) => OID_INT8,
+        QueryParameter::Float(_) => OID_FLOAT8,
+        QueryParameter::Text(_) => OID_TEXT,
+        QueryParameter::Binary(_) => OID_BYTEA,
+    }
+}
+
+/// Binary-format (1) value bytes; `None` for NULL (negative length on the
+/// wire). `Text` and `Binary` share the same length-prefixed layout, so the
+/// byte form is identical for both formats.
+fn param_binary(param: &QueryParameter) -> Option<Vec<u8>> {
+    match param {
+        QueryParameter::Null => None,
+        QueryParameter::Boolean(value) => Some(vec![u8::from(*value)]),
+        QueryParameter::Integer(value) => Some(value.to_be_bytes().to_vec()),
+        QueryParameter::Float(value) => Some(value.to_be_bytes().to_vec()),
+        QueryParameter::Text(value) => Some(value.clone().into_bytes()),
+        QueryParameter::Binary(value) => Some(value.clone()),
+    }
+}
+
+/// One extended-query execution outcome: text-format rows plus the command
+/// tag metadata (shared `StatementResult` fields, extended-protocol shaped).
+pub struct ExtendedResult {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<Option<String>>>,
+    pub command_tag: Option<String>,
+    pub affected_rows: Option<i64>,
+}
 
 /// Protocol 3.0 major=3 minor=0 → 196608 (standard startup since PostgreSQL 7.4).
 pub const PROTOCOL_VERSION_3: i32 = 196608;
@@ -313,6 +357,19 @@ fn error_response(payload: &[u8]) -> ConnectionError {
     }
 }
 
+/// Runtime (post-startup) errors are statement execution failures, not
+/// authentication problems: everything lands in `ExecutionFailed`.
+/// TODO(error-codes): classify by the `C` field (SQLSTATE) when the pg error
+/// code map lands.
+fn runtime_error_response(payload: &[u8]) -> ConnectionError {
+    let fields = parse_fields(payload);
+    let message = fields
+        .get(&'M')
+        .map(String::as_str)
+        .unwrap_or("unknown server error");
+    ConnectionError::ExecutionFailed(message.to_owned())
+}
+
 fn required_password(target: &PostgresTarget) -> Result<String, ConnectionError> {
     target.password.clone().ok_or(ConnectionError::AuthFailed)
 }
@@ -419,6 +476,24 @@ fn apply_parameter_status(params: &mut HashMap<String, String>, payload: &[u8]) 
     if let Some((value, _)) = read_cstring(next) {
         params.insert(key, value);
     }
+}
+
+/// CommandComplete payload is the tag plus its trailing NUL
+/// (`SELECT 2\0`, `INSERT 0 1\0`, `BEGIN\0`).
+fn parse_command_tag(payload: &[u8]) -> String {
+    let end = payload
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(payload.len());
+    String::from_utf8_lossy(&payload[..end]).into_owned()
+}
+
+/// Trailing number of the tag when present and entirely decimal
+/// (`SELECT 2` -> 2, `INSERT 0 1` -> 1, `BEGIN` -> None).
+fn tag_affected_rows(tag: &str) -> Option<i64> {
+    tag.rsplit(' ')
+        .next()
+        .and_then(|token| token.parse::<i64>().ok())
 }
 
 /// Row description: column count, then per column `name\0` plus 18 fixed
@@ -565,11 +640,116 @@ impl Connection {
                 b'D' => result.rows.push(parse_data_row(&payload)?),
                 // CommandComplete, EmptyQueryResponse, Notice, ParameterStatus.
                 b'C' | b'I' | b'N' | b'S' => {}
-                b'E' => return Err(error_response(&payload)),
+                b'E' => return Err(runtime_error_response(&payload)),
                 b'Z' => return Ok(result),
                 other => {
                     return Err(ConnectionError::Protocol(format!(
                         "unexpected message {other} during query"
+                    )));
+                }
+            }
+        }
+    }
+
+    /// Extended query protocol for one prepared statement with parameters:
+    /// `Parse` (unnamed statement, declared OIDs) -> `Bind` (unnamed portal,
+    /// binary-format params, text-format results) -> `Describe` portal ->
+    /// `Execute` (all rows) -> `Sync`. Errors are collected and reported
+    /// after `ReadyForQuery`, leaving the connection reusable (the aborting
+    /// implicit transaction rolls back at `Sync`).
+    pub async fn extended_query(
+        &mut self,
+        sql: &str,
+        params: &[QueryParameter],
+    ) -> Result<ExtendedResult, ConnectionError> {
+        // Parse: [name\0][sql\0][i16 param count][i32 oid per param].
+        let mut parse_payload = vec![0u8];
+        parse_payload.extend_from_slice(sql.as_bytes());
+        parse_payload.push(0);
+        parse_payload.extend_from_slice(&(params.len() as i16).to_be_bytes());
+        for param in params {
+            parse_payload.extend_from_slice(&param_type_oid(param).to_be_bytes());
+        }
+        write_message(&mut self.stream, b'P', &parse_payload).await?;
+
+        // Bind: [portal\0][statement\0][param formats][param values]
+        // [result formats]; every parameter is binary (1), every result is
+        // text (0).
+        let mut bind_payload = vec![0u8, 0u8];
+        bind_payload.extend_from_slice(&(params.len() as i16).to_be_bytes());
+        for _ in params {
+            bind_payload.extend_from_slice(&1i16.to_be_bytes());
+        }
+        bind_payload.extend_from_slice(&(params.len() as i16).to_be_bytes());
+        for param in params {
+            match param_binary(param) {
+                Some(bytes) => {
+                    bind_payload.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
+                    bind_payload.extend(bytes);
+                }
+                None => bind_payload.extend_from_slice(&(-1i32).to_be_bytes()),
+            }
+        }
+        bind_payload.extend_from_slice(&1i16.to_be_bytes());
+        bind_payload.extend_from_slice(&0i16.to_be_bytes());
+        write_message(&mut self.stream, b'B', &bind_payload).await?;
+
+        // Describe portal: returns ParameterDescription + RowDescription
+        // (or NoData for non-row statements).
+        write_message(&mut self.stream, b'D', b"P\0").await?;
+
+        // Execute: [portal\0][i32 max_rows]; 0 = return every row (no
+        // PortalSuspended path).
+        let mut execute_payload = vec![0u8];
+        execute_payload.extend_from_slice(&0i32.to_be_bytes());
+        write_message(&mut self.stream, b'E', &execute_payload).await?;
+
+        write_message(&mut self.stream, b'S', &[]).await?;
+
+        let mut result = ExtendedResult {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            command_tag: None,
+            affected_rows: None,
+        };
+        let mut runtime_error: Option<ConnectionError> = None;
+        loop {
+            let (tag, payload) = read_message(&mut self.stream).await?;
+            match tag {
+                // ParseComplete, BindComplete, ParameterDescription.
+                b'1' | b'2' | b't' => {}
+                b'T' => result.columns = parse_row_description(&payload),
+                // NoData for statements that do not return rows.
+                b'n' => {}
+                b'D' => result.rows.push(parse_data_row(&payload)?),
+                // CommandComplete: capture the tag; trailing digits are the
+                // affected-rows count.
+                b'C' => {
+                    result.command_tag = Some(parse_command_tag(&payload));
+                    result.affected_rows =
+                        result.command_tag.as_deref().and_then(tag_affected_rows);
+                }
+                // Notice, BackendKeyData, ParameterStatus, NegotiateProtocolVersion.
+                b'N' | b'K' | b'S' | b'v' => {}
+                b'E' => {
+                    // Keep draining until `Z` so the connection stays in a
+                    // well-defined state for the next statement.
+                    runtime_error = Some(runtime_error_response(&payload));
+                }
+                b'Z' => {
+                    if let Some(error) = runtime_error {
+                        return Err(error);
+                    }
+                    return Ok(result);
+                }
+                b's' => {
+                    return Err(ConnectionError::Protocol(
+                        "unexpected PortalSuspended (max_rows=0)".to_owned(),
+                    ));
+                }
+                other => {
+                    return Err(ConnectionError::Protocol(format!(
+                        "unexpected message {other} during extended query"
                     )));
                 }
             }
