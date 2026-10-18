@@ -39,7 +39,7 @@ pub struct QueryResult {
 /// Transport-agnostic stream: plaintext TCP or a completed TLS 1.x session.
 pub enum NetStream {
     Plain(TcpStream),
-    Tls(tokio_rustls::client::TlsStream<TcpStream>),
+    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
 }
 
 impl AsyncRead for NetStream {
@@ -50,7 +50,7 @@ impl AsyncRead for NetStream {
     ) -> Poll<io::Result<()>> {
         match &mut *self {
             Self::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
-            Self::Tls(stream) => Pin::new(stream).poll_read(cx, buf),
+            Self::Tls(stream) => Pin::new(&mut **stream).poll_read(cx, buf),
         }
     }
 }
@@ -63,7 +63,7 @@ impl AsyncWrite for NetStream {
     ) -> Poll<Result<usize, io::Error>> {
         match &mut *self {
             Self::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
-            Self::Tls(stream) => Pin::new(stream).poll_write(cx, buf),
+            Self::Tls(stream) => Pin::new(&mut **stream).poll_write(cx, buf),
         }
     }
 
@@ -74,7 +74,7 @@ impl AsyncWrite for NetStream {
     ) -> Poll<Result<usize, io::Error>> {
         match &mut *self {
             Self::Plain(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
-            Self::Tls(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
+            Self::Tls(stream) => Pin::new(&mut **stream).poll_write_vectored(cx, bufs),
         }
     }
 
@@ -91,7 +91,7 @@ impl AsyncWrite for NetStream {
     ) -> Poll<Result<(), io::Error>> {
         match &mut *self {
             Self::Plain(stream) => Pin::new(stream).poll_flush(cx),
-            Self::Tls(stream) => Pin::new(stream).poll_flush(cx),
+            Self::Tls(stream) => Pin::new(&mut **stream).poll_flush(cx),
         }
     }
 
@@ -101,7 +101,7 @@ impl AsyncWrite for NetStream {
     ) -> Poll<Result<(), io::Error>> {
         match &mut *self {
             Self::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
-            Self::Tls(stream) => Pin::new(stream).poll_shutdown(cx),
+            Self::Tls(stream) => Pin::new(&mut **stream).poll_shutdown(cx),
         }
     }
 }
@@ -143,7 +143,9 @@ async fn read_exact<S: AsyncRead + Unpin>(
 
 /// Reads one backend message; the length prefix (which counts itself) is
 /// consumed and validated.
-async fn read_message<S: AsyncRead + Unpin>(stream: &mut S) -> Result<(u8, Vec<u8>), ConnectionError> {
+async fn read_message<S: AsyncRead + Unpin>(
+    stream: &mut S,
+) -> Result<(u8, Vec<u8>), ConnectionError> {
     let mut tag = [0u8; 1];
     read_exact(stream, &mut tag).await?;
     let mut length = [0u8; 4];
@@ -159,11 +161,11 @@ async fn read_message<S: AsyncRead + Unpin>(stream: &mut S) -> Result<(u8, Vec<u
     Ok((tag[0], payload))
 }
 
-async fn write_all<S: AsyncWrite + Unpin>(stream: &mut S, bytes: &[u8]) -> Result<(), ConnectionError> {
-    stream
-        .write_all(bytes)
-        .await
-        .map_err(|_| io_err())?;
+async fn write_all<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    bytes: &[u8],
+) -> Result<(), ConnectionError> {
+    stream.write_all(bytes).await.map_err(|_| io_err())?;
     stream.flush().await.map_err(|_| io_err())
 }
 
@@ -252,17 +254,21 @@ fn tls_client_config(target: &PostgresTarget) -> Result<Arc<ClientConfig>, Conne
         }
     }
 
-    let builder = ClientConfig::builder_with_provider(rustls::crypto::ring::default_provider().into())
-        .with_safe_default_protocol_versions()
-        .map_err(|_| ConnectionError::Protocol("TLS protocol versions unavailable".to_owned()))?;
-    let config = builder
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+    let builder =
+        ClientConfig::builder_with_provider(rustls::crypto::ring::default_provider().into())
+            .with_safe_default_protocol_versions()
+            .map_err(|_| {
+                ConnectionError::Protocol("TLS protocol versions unavailable".to_owned())
+            })?;
+    let config = builder.with_root_certificates(roots).with_no_client_auth();
     Ok(Arc::new(config))
 }
 
 /// SSLRequest + TLS handshake. Always full certificate verification.
-async fn tls_upgrade(stream: TcpStream, target: &PostgresTarget) -> Result<NetStream, ConnectionError> {
+async fn tls_upgrade(
+    stream: TcpStream,
+    target: &PostgresTarget,
+) -> Result<NetStream, ConnectionError> {
     let connector = TlsConnector::from(tls_client_config(target)?);
     let server_name = ServerName::try_from(target.host.clone()).map_err(|_| {
         ConnectionError::Protocol(format!("invalid TLS server name: {}", target.host))
@@ -271,7 +277,7 @@ async fn tls_upgrade(stream: TcpStream, target: &PostgresTarget) -> Result<NetSt
         .connect(server_name, stream)
         .await
         .map_err(|error| ConnectionError::Protocol(format!("TLS handshake failed: {error}")))?;
-    Ok(NetStream::Tls(tls_stream))
+    Ok(NetStream::Tls(Box::new(tls_stream)))
 }
 
 /// Parses an `ErrorResponse`/`NoticeResponse` payload: repeated
@@ -308,10 +314,7 @@ fn error_response(payload: &[u8]) -> ConnectionError {
 }
 
 fn required_password(target: &PostgresTarget) -> Result<String, ConnectionError> {
-    target
-        .password
-        .clone()
-        .ok_or(ConnectionError::AuthFailed)
+    target.password.clone().ok_or(ConnectionError::AuthFailed)
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
@@ -385,9 +388,7 @@ async fn handle_auth<S: AsyncWrite + Unpin>(
         12 => {
             // AuthenticationSASLFinal: server-final-message data.
             let Some(client) = scram.as_ref() else {
-                return Err(ConnectionError::Protocol(
-                    "unexpected SASLFinal".to_owned(),
-                ));
+                return Err(ConnectionError::Protocol("unexpected SASLFinal".to_owned()));
             };
             client.verify_server_final(&payload[4..])?;
         }
@@ -523,9 +524,7 @@ impl Connection {
                 let mut answer = [0u8; 1];
                 read_exact(&mut tcp, &mut answer).await?;
                 match (answer[0], target.ssl_mode) {
-                    (b'S', SslMode::Prefer | SslMode::Require) => {
-                        tls_upgrade(tcp, target).await?
-                    }
+                    (b'S', SslMode::Prefer | SslMode::Require) => tls_upgrade(tcp, target).await?,
                     (b'N', SslMode::Prefer) => NetStream::Plain(tcp),
                     (b'N', _) => {
                         return Err(ConnectionError::Protocol(

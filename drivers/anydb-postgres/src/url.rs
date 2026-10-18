@@ -45,7 +45,13 @@ pub struct PostgresTarget {
 pub const DEFAULT_PORT: u16 = 5432;
 
 impl PostgresTarget {
-    fn plain(host: String, port: u16, user: String, password: Option<String>, database: Option<String>) -> Self {
+    fn plain(
+        host: String,
+        port: u16,
+        user: String,
+        password: Option<String>,
+        database: Option<String>,
+    ) -> Self {
         Self {
             host,
             port,
