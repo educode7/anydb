@@ -331,6 +331,134 @@ impl Driver for RollbackDriver {
     }
 }
 
+// ---------- typed statement execution through the pipeline ----------
+
+/// Data source with a typed catalog behavior: the first typed execution
+/// fails with 25P02, the rest succeed with typed rows; rollbacks counted.
+struct TypedEchoSource {
+    calls: Arc<AtomicUsize>,
+    rollbacks: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl DataSource for TypedEchoSource {
+    fn metadata(&self) -> DataSourceMetadata {
+        DataSourceMetadata {
+            product_name: "Fake".into(),
+            product_version: "0".into(),
+            driver_name: "fake-typed".into(),
+        }
+    }
+
+    async fn ping(&self) -> ConnectionResult<()> {
+        Ok(())
+    }
+
+    async fn rollback_transaction(&self) -> ConnectionResult<()> {
+        self.rollbacks.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn execute_statement_typed(
+        &self,
+        _sql: &str,
+        _params: &[QueryParameter],
+    ) -> ConnectionResult<TypedStatementResult> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        if call == 0 {
+            return Err(ConnectionError::ExecutionFailed {
+                sqlstate: Some("25P02".to_owned()),
+                message: "current transaction is aborted".into(),
+            });
+        }
+        Ok(TypedStatementResult {
+            columns: vec!["n".into()],
+            rows: vec![vec![Some(TypedValue::Int8(7))]],
+            command_tag: Some("SELECT 1".into()),
+            affected_rows: Some(1),
+        })
+    }
+
+    async fn close(&self) {}
+}
+
+/// Classified driver exposing the typed counting data source.
+struct TypedDriver {
+    descriptor: DriverDescriptor,
+    calls: Arc<AtomicUsize>,
+    rollbacks: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Driver for TypedDriver {
+    fn descriptor(&self) -> &DriverDescriptor {
+        &self.descriptor
+    }
+
+    fn error_classifier(&self) -> Option<Arc<dyn ErrorClassifier>> {
+        Some(Arc::new(SqlstateClassifier))
+    }
+
+    async fn open_data_source(
+        &self,
+        _request: OpenRequest,
+    ) -> ConnectionResult<Arc<dyn DataSource>> {
+        Ok(Arc::new(TypedEchoSource {
+            calls: self.calls.clone(),
+            rollbacks: self.rollbacks.clone(),
+        }) as Arc<dyn DataSource>)
+    }
+}
+
+#[tokio::test]
+async fn typed_statement_execution_runs_inside_the_recovery_pipeline() {
+    let events = RecordingEvents::new();
+    let secrets = MemorySecrets::new();
+    secrets.register("dst1");
+    let secrets_dyn: Arc<dyn SecretsStore> = secrets;
+    let events_dyn: Arc<dyn ConnectionEvents> = events.clone();
+    let app = App::new(secrets_dyn, events_dyn);
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let rollbacks = Arc::new(AtomicUsize::new(0));
+    app.add_container(
+        Arc::new(TypedDriver {
+            descriptor: DriverDescriptor::new("fake-typed", "Fake Typed", true),
+            calls: calls.clone(),
+            rollbacks: rollbacks.clone(),
+        }),
+        "dst1",
+        ConnectionProperties::new("typed://host/db"),
+        vec![],
+    );
+
+    app.connect("dst1").await.expect("connect ok");
+
+    // First attempt aborts (25P02 -> TransactionAborted): the pipeline
+    // rolls the live transaction back through the invalidator and retries,
+    // returning typed rows from the successful attempt.
+    let result = app
+        .execute_statement_typed("dst1", "SELECT $1", &[QueryParameter::Integer(7)])
+        .await
+        .expect("typed statement must recover");
+    assert_eq!(
+        result.columns,
+        vec!["n".to_owned()],
+        "typed columns surface at the App level"
+    );
+    assert_eq!(result.rows, vec![vec![Some(TypedValue::Int8(7))]]);
+    assert_eq!(result.command_tag.as_deref(), Some("SELECT 1"));
+
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "one retry after the abort");
+    assert_eq!(
+        rollbacks.load(Ordering::SeqCst),
+        1,
+        "the abort invalidation rolled the live transaction back once"
+    );
+
+    app.shutdown().await;
+}
+
 #[tokio::test]
 async fn aborted_transaction_recovery_rolls_back_the_live_connection() {
     let events = RecordingEvents::new();

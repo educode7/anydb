@@ -20,7 +20,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use anydb_shared::ConnectionError;
 use anydb_shared::driver::descriptor::DriverDescriptor;
 use anydb_shared::driver::spi::{DataSource, DataSourceMetadata, Driver, OpenRequest};
-use anydb_shared::driver::statement::{QueryParameter, StatementResult};
+use anydb_shared::driver::statement::{QueryParameter, StatementResult, TypedStatementResult};
 
 use crate::protocol::Connection as WireConnection;
 use crate::url::{PostgresTarget, SslMode, parse_target};
@@ -212,6 +212,26 @@ impl DataSource for WireDataSource {
             .extended_query(sql, params)
             .await
             .map(statement_result)
+    }
+
+    /// Typed execution: binary format for cataloged column types, text for
+    /// the rest, driven by the `types` catalog (NULL is `None`).
+    async fn execute_statement_typed(
+        &self,
+        sql: &str,
+        params: &[QueryParameter],
+    ) -> Result<TypedStatementResult, ConnectionError> {
+        let typed = WireDataSource::execute_typed_statement(self, sql, params).await?;
+        Ok(TypedStatementResult {
+            columns: typed
+                .columns
+                .into_iter()
+                .map(|column| column.name)
+                .collect(),
+            rows: typed.rows,
+            command_tag: typed.command_tag,
+            affected_rows: typed.affected_rows,
+        })
     }
 
     /// `ROLLBACK` over the live connection: normalizes the aborted

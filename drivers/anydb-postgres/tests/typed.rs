@@ -7,8 +7,10 @@
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+use anydb_postgres::PostgresDriver;
 use anydb_postgres::protocol::{ColumnMeta, Connection as WireConnection};
 use anydb_postgres::types;
+use anydb_shared::driver::spi::{Driver, OpenRequest};
 use anydb_shared::driver::statement::{QueryParameter, TypedValue};
 
 // ---------- transport helpers (same pattern as extended.rs) ----------
@@ -298,6 +300,56 @@ async fn typed_row_cycle_server(mut stream: TcpStream) {
     .await;
     send(&mut stream, b'C', b"SELECT 2\0").await;
     ready_for_query(&mut stream).await;
+}
+
+#[tokio::test]
+async fn execute_statement_typed_goes_through_the_spi() {
+    let (address, server) = spawn_backend(typed_row_cycle_server).await;
+    let driver = PostgresDriver::new();
+    let request = OpenRequest {
+        container_id: "c1".into(),
+        target: format!("postgres://user@{}/db", address),
+        properties: Default::default(),
+    };
+    let source = driver.open_data_source(request).await.expect("open");
+
+    let result = source
+        .execute_statement_typed(
+            "SELECT $1, $2, $3, $4",
+            &[
+                QueryParameter::Integer(42),
+                QueryParameter::Float(3.5),
+                QueryParameter::Boolean(true),
+                QueryParameter::Text("hola".to_owned()),
+            ],
+        )
+        .await
+        .expect("typed SPI execute");
+
+    assert_eq!(result.columns, vec!["n", "f", "b", "x", "num"]);
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![
+                Some(TypedValue::Int8(42)),
+                Some(TypedValue::Float8(3.5)),
+                Some(TypedValue::Boolean(true)),
+                Some(TypedValue::Text("hola".into())),
+                Some(TypedValue::Text("1.23".into())),
+            ],
+            vec![
+                None,
+                Some(TypedValue::Float8(2.5)),
+                Some(TypedValue::Boolean(false)),
+                None,
+                Some(TypedValue::Text("7.8".into())),
+            ],
+        ]
+    );
+    assert_eq!(result.command_tag.as_deref(), Some("SELECT 2"));
+
+    source.close().await;
+    server.await.expect("server task");
 }
 
 #[tokio::test]

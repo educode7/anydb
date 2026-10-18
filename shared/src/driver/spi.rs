@@ -8,7 +8,7 @@ use async_trait::async_trait;
 
 use super::classification::ErrorClassifier;
 use super::descriptor::DriverDescriptor;
-use super::statement::{QueryParameter, StatementResult};
+use super::statement::{QueryParameter, StatementResult, TypedStatementResult};
 use crate::ConnectionError;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenRequest {
@@ -60,6 +60,19 @@ pub trait DataSource: Send + Sync {
         sql: &str,
         params: &[QueryParameter],
     ) -> Result<StatementResult, ConnectionError> {
+        let _ = (sql, params);
+        Err(ConnectionError::DriverFailure)
+    }
+
+    /// Typed execution: the same statement contract with the driver's own
+    /// binary / text type catalog applied (DBeaver `TypedValue` analog).
+    /// Default: not supported (query-only readers), surfacing
+    /// `ConnectionError::DriverFailure`.
+    async fn execute_statement_typed(
+        &self,
+        sql: &str,
+        params: &[QueryParameter],
+    ) -> Result<TypedStatementResult, ConnectionError> {
         let _ = (sql, params);
         Err(ConnectionError::DriverFailure)
     }

@@ -27,6 +27,7 @@ use anydb_connections::execution::domain::value_objects::recovery_policy::Recove
 use anydb_connections::execution::domain::value_objects::recovery_state::RecoveryState;
 use anydb_shared::driver::io::{ConnectionProperties, NetworkHandler};
 use anydb_shared::driver::spi::Driver;
+use anydb_shared::driver::statement::{QueryParameter, TypedStatementResult};
 use anydb_shared::ports::Clock;
 use anydb_shared::ports::SystemClock;
 use anydb_shared::{ConnectionError, ConnectionResult, RecoveryScope};
@@ -60,6 +61,7 @@ pub mod prelude {
     pub use anydb_shared::driver::descriptor::DriverDescriptor;
     pub use anydb_shared::driver::io::{ConnectionProperties, NetworkHandler, NetworkHandlerKind};
     pub use anydb_shared::driver::spi::{DataSource, DataSourceMetadata, Driver, OpenRequest};
+    pub use anydb_shared::driver::statement::{QueryParameter, TypedStatementResult, TypedValue};
     pub use anydb_shared::ports::{Clock, SystemClock};
     pub use anydb_shared::{ConnectionError, ConnectionResult, ErrorType, RecoveryScope};
 }
@@ -183,6 +185,35 @@ impl App {
                 op()
             })
             .await
+    }
+
+    /// Typed statement execution over the connected data source, inside
+    /// the same bounded recovery runner as `execute_with_recovery`: a
+    /// classified abort rolls the live transaction back and retries; a
+    /// driver without a catalog surfaces `DriverFailure`.
+    pub async fn execute_statement_typed(
+        &self,
+        container_id: &str,
+        sql: &str,
+        params: &[QueryParameter],
+    ) -> ConnectionResult<TypedStatementResult> {
+        self.module.container(container_id)?;
+        // The live data source is captured once: Transactions-scope
+        // invalidation rolls it back in place, and the retry reuses it.
+        let source = self
+            .module
+            .container(container_id)?
+            .data_source()
+            .ok_or(ConnectionError::AlreadyDisconnected)?;
+        let sql = sql.to_owned();
+        let params: Vec<QueryParameter> = params.to_vec();
+        self.execute_with_recovery(container_id, move || {
+            let source = source.clone();
+            let sql = sql.clone();
+            let params = params.clone();
+            async move { source.execute_statement_typed(&sql, &params).await }
+        })
+        .await
     }
 
     fn recovery_runner(&self, container_id: &str) -> RecoveryRunner {

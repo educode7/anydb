@@ -35,6 +35,21 @@ pub struct StatementResult {
     pub affected_rows: Option<i64>,
 }
 
+/// Result of one prepared-statement execution with typed values applied by
+/// the driver's binary / text type catalog (DBeaver `TypedValue` rendering
+/// analog). Driver-neutral: columns carry names only; richer driver-specific
+/// metadata (Postgres type OIDs) stays in the driver's own typed layer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedStatementResult {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<Option<TypedValue>>>,
+    /// Last `CommandComplete` tag verbatim (`UPDATE 3`, `SELECT 2`, ...).
+    pub command_tag: Option<String>,
+    /// Trailing batch count of the tag when it is a plain number
+    /// (`UPDATE 3` -> 3, `INSERT 0 1` -> 1, `BEGIN` -> None).
+    pub affected_rows: Option<i64>,
+}
+
 /// A typed result value produced by a driver's binary / text type catalog
 /// (DBeaver `TypedValue` analog). One variant per supported native type;
 /// drivers keep narrower types (`int2`/`int4`, `float4`/`float8`) distinct
