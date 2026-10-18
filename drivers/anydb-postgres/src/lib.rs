@@ -198,6 +198,12 @@ impl DataSource for WireDataSource {
             .map(statement_result)
     }
 
+    /// `ROLLBACK` over the live connection: normalizes the aborted
+    /// transaction state back to idle.
+    async fn rollback_transaction(&self) -> Result<(), ConnectionError> {
+        WireDataSource::rollback_transaction(self).await
+    }
+
     async fn close(&self) {
         if let Some(connection) = self.connection.lock().await.take() {
             connection.terminate().await;

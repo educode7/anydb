@@ -64,5 +64,13 @@ pub trait DataSource: Send + Sync {
         Err(ConnectionError::DriverFailure)
     }
 
+    /// Rolls back the live transaction after an abort (DBeaver invalidates
+    /// transactions by running a rollback). Default: the driver does not
+    /// carry transaction semantics, surfacing
+    /// `ConnectionError::DriverFailure`.
+    async fn rollback_transaction(&self) -> Result<(), ConnectionError> {
+        Err(ConnectionError::DriverFailure)
+    }
+
     async fn close(&self);
 }

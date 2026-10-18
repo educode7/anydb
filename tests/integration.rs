@@ -275,3 +275,97 @@ async fn driver_classifier_feeds_the_recovery_loop() {
 
     app.shutdown().await;
 }
+
+// ---------- Transactions-scope invalidation runs a live rollback ----------
+
+/// Data source counting every live ROLLBACK the invalidation bridge issues.
+struct CountingRollbackSource {
+    counter: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl DataSource for CountingRollbackSource {
+    fn metadata(&self) -> DataSourceMetadata {
+        DataSourceMetadata {
+            product_name: "Fake".into(),
+            product_version: "0".into(),
+            driver_name: "fake-rollback".into(),
+        }
+    }
+
+    async fn ping(&self) -> ConnectionResult<()> {
+        Ok(())
+    }
+
+    async fn rollback_transaction(&self) -> ConnectionResult<()> {
+        self.counter.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn close(&self) {}
+}
+
+/// The classified driver, but its data source counts live rollbacks.
+struct RollbackDriver {
+    descriptor: DriverDescriptor,
+    counter: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Driver for RollbackDriver {
+    fn descriptor(&self) -> &DriverDescriptor {
+        &self.descriptor
+    }
+
+    fn error_classifier(&self) -> Option<Arc<dyn ErrorClassifier>> {
+        Some(Arc::new(SqlstateClassifier))
+    }
+
+    async fn open_data_source(
+        &self,
+        _request: OpenRequest,
+    ) -> ConnectionResult<Arc<dyn DataSource>> {
+        Ok(Arc::new(CountingRollbackSource {
+            counter: self.counter.clone(),
+        }) as Arc<dyn DataSource>)
+    }
+}
+
+#[tokio::test]
+async fn aborted_transaction_recovery_rolls_back_the_live_connection() {
+    let events = RecordingEvents::new();
+    let secrets = MemorySecrets::new();
+    secrets.register("dsr2");
+    let secrets_dyn: Arc<dyn SecretsStore> = secrets;
+    let events_dyn: Arc<dyn ConnectionEvents> = events.clone();
+    let app = App::new(secrets_dyn, events_dyn);
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    app.add_container(
+        Arc::new(RollbackDriver {
+            descriptor: DriverDescriptor::new("fake-rollback", "Fake Rollback", true),
+            counter: counter.clone(),
+        }),
+        "dsr2",
+        ConnectionProperties::new("rollback://host/db"),
+        vec![],
+    );
+
+    app.connect("dsr2").await.expect("connect ok");
+
+    // 25P02 -> TransactionAborted -> Transactions-scope invalidation, which
+    // now executes a live ROLLBACK on the data source before the retry.
+    let (result, attempts) = run_state_sequence(&app, "dsr2", "25P02", "42601", 1).await;
+    assert!(result.is_ok(), "the aborted statement must be retried");
+    assert_eq!(attempts, 2);
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        1,
+        "the invalidation must roll back the live connection exactly once"
+    );
+
+    let snapshot = events.entries.lock().await.clone();
+    assert!(snapshot.contains(&"dsr2:InvalidatedTransaction".to_string()));
+
+    app.shutdown().await;
+}

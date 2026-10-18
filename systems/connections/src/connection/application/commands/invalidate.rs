@@ -30,6 +30,13 @@ impl InvalidateHandler {
 
         match scope {
             InvalidateScope::Transactions => {
+                // DBeaver analog: invalidating transactions runs a rollback
+                // over the live connection, normalizing the aborted state
+                // back to idle. A failed rollback is not fatal here: the
+                // recovery retry surfaces the live problem on its attempt.
+                if let Some(data_source) = container.data_source() {
+                    let _ = data_source.rollback_transaction().await;
+                }
                 deps.events
                     .on_event(container.id(), ConnectionEventKind::InvalidatedTransaction)
                     .await;
