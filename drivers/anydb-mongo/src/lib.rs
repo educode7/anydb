@@ -88,4 +88,20 @@ mod tests {
         assert_eq!(source.metadata().driver_name, "anydb-mongo");
         source.close().await;
     }
+
+    #[tokio::test]
+    async fn statement_execution_falls_back_to_the_default_error() {
+        let driver = MongoDriver::new();
+        let request = OpenRequest {
+            container_id: "c1".into(),
+            target: "mongodb://host".into(),
+            properties: Default::default(),
+        };
+        let source = driver.open_data_source(request).await.unwrap();
+        let error = source
+            .execute_statement("find {}", &[])
+            .await
+            .expect_err("query-only driver must not execute statements");
+        assert_eq!(error, ConnectionError::DriverFailure);
+    }
 }

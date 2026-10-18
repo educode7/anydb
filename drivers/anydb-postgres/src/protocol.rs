@@ -61,6 +61,7 @@ fn param_binary(param: &QueryParameter) -> Option<Vec<u8>> {
 
 /// One extended-query execution outcome: text-format rows plus the command
 /// tag metadata (shared `StatementResult` fields, extended-protocol shaped).
+#[derive(Debug, Clone, PartialEq)]
 pub struct ExtendedResult {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<Option<String>>>,
