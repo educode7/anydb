@@ -7,6 +7,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use super::descriptor::DriverDescriptor;
+use super::statement::{QueryParameter, StatementResult};
 use crate::ConnectionError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +42,20 @@ pub trait DataSource: Send + Sync {
 
     /// Keepalive probe for the `KeepAlivePingJob` analog.
     async fn ping(&self) -> Result<(), ConnectionError>;
+
+    /// Executes one statement with parameters over the driver's prepared /
+    /// extended path (text-format results, `QueryParameter` typed input).
+    /// Default implementation: the driver does not support statement
+    /// execution (query-only readers), surfacing
+    /// `ConnectionError::DriverFailure`.
+    async fn execute_statement(
+        &self,
+        sql: &str,
+        params: &[QueryParameter],
+    ) -> Result<StatementResult, ConnectionError> {
+        let _ = (sql, params);
+        Err(ConnectionError::DriverFailure)
+    }
 
     async fn close(&self);
 }

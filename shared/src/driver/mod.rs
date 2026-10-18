@@ -4,3 +4,6 @@
 pub mod descriptor;
 pub mod io;
 pub mod spi;
+pub mod statement;
+
+pub use statement::{QueryParameter, StatementResult};

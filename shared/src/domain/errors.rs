@@ -27,6 +27,11 @@ pub enum ConnectionError {
     /// Driver wire/protocol-level failure. Message detail is produced by
     /// drivers and must never embed secrets (user/password).
     Protocol(String),
+    #[error("statement execution failed: {0}")]
+    /// Server-reported statement execution error (SQL runtime failures).
+    /// Detail comes from the server error response and must not embed
+    /// secrets (user/password).
+    ExecutionFailed(String),
     #[error("driver failure")]
     DriverFailure,
     #[error("operation canceled")]
