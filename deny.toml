@@ -1,0 +1,47 @@
+# cargo-deny policy for anydb.
+# Quality gate: `cargo deny check` (see aca_config.yaml tooling).
+
+[graph]
+# Review the dependency graph of every workspace member. Dev deps are
+# included (exclude-dev defaults to false).
+
+[licenses]
+version = 2
+# Permissive licenses only; anything else makes the workspace unbuildable
+# under CI policy. Extend deliberately, never by exception creep.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+]
+confidence-threshold = 0.93
+
+[advisories]
+version = 2
+# Ignore-list stays empty; a targeted exception must document the reason.
+ignore = []
+# Building on yanked releases is a supply-chain hazard.
+yanked = "warn"
+
+[bans]
+# Duplicate crates: warn now (scaffold), tighten to deny once the driver
+# crates pull real ecosystems (sqlx, mongodb) where some dupes are normal.
+multiple-versions = "warn"
+# Wildcard hygiene. Note: `{ dep.workspace = true }` manifests show a `*`
+# version requirement in cargo metadata, so intra-workspace deps are counted
+# as wildcards by cargo-deny; "warn" keeps them visible without breaking
+# workspace inheritance.
+wildcards = "warn"
+allow-wildcard-paths = false
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
