@@ -34,3 +34,61 @@ pub struct StatementResult {
     /// (`UPDATE 3` -> 3, `INSERT 0 1` -> 1, `BEGIN` -> None).
     pub affected_rows: Option<i64>,
 }
+
+/// A typed result value produced by a driver's binary / text type catalog
+/// (DBeaver `TypedValue` analog). One variant per supported native type;
+/// drivers keep narrower types (`int2`/`int4`, `float4`/`float8`) distinct
+/// so callers can see the declared column type.
+///
+/// `Display` renders platform-friendly text: booleans as `true`/`false`
+/// (not Postgres' `t`/`f`), bytea with the `\x` hex prefix (Postgres
+/// canonical), and non-finite floats as Postgres canonical text
+/// (`NaN`, `Infinity`, `-Infinity`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum TypedValue {
+    Boolean(bool),
+    Int2(i16),
+    Int4(i32),
+    Int8(i64),
+    Float4(f32),
+    Float8(f64),
+    Text(String),
+    /// Opaque driver-native bytes (Postgres: `bytea`).
+    Bytea(Vec<u8>),
+}
+
+impl std::fmt::Display for TypedValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Boolean(value) => write!(f, "{}", if *value { "true" } else { "false" }),
+            Self::Int2(value) => write!(f, "{value}"),
+            Self::Int4(value) => write!(f, "{value}"),
+            Self::Int8(value) => write!(f, "{value}"),
+            Self::Float4(value) => write!(f, "{}", float_text(*value as f64)),
+            Self::Float8(value) => write!(f, "{}", float_text(*value)),
+            Self::Text(value) => write!(f, "{value}"),
+            Self::Bytea(bytes) => {
+                write!(f, "\\x")?;
+                for byte in bytes {
+                    write!(f, "{byte:02x}")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Non-finite floats render as Postgres canonical text; finite floats use
+/// the shortest Rust representation (`4` for `4.0`), matching how the
+/// server prints them.
+fn float_text(value: f64) -> String {
+    if value.is_nan() {
+        "NaN".to_owned()
+    } else if value == f64::INFINITY {
+        "Infinity".to_owned()
+    } else if value == f64::NEG_INFINITY {
+        "-Infinity".to_owned()
+    } else {
+        value.to_string()
+    }
+}

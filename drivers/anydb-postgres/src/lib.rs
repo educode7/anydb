@@ -9,6 +9,7 @@
 pub mod auth;
 pub mod classification;
 pub mod protocol;
+pub mod types;
 pub mod url;
 
 use std::sync::Arc;
@@ -80,6 +81,21 @@ impl WireDataSource {
             return Err(ConnectionError::DriverFailure);
         };
         connection.simple_query(sql).await
+    }
+
+    /// Typed statement execution over the live connection: binary format
+    /// for cataloged column types, text for the rest. Row values come back
+    /// as shared `TypedValue`s (NULL is `None`).
+    pub async fn execute_typed_statement(
+        &self,
+        sql: &str,
+        params: &[QueryParameter],
+    ) -> Result<protocol::TypedResult, ConnectionError> {
+        let mut guard = self.connection.lock().await;
+        let Some(connection) = guard.as_mut() else {
+            return Err(ConnectionError::DriverFailure);
+        };
+        connection.typed_query(sql, params).await
     }
 
     /// Explicit `BEGIN` over the live connection.

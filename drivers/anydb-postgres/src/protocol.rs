@@ -21,8 +21,45 @@ use rustls::{ClientConfig, RootCertStore};
 
 use anydb_shared::ConnectionError;
 use anydb_shared::driver::statement::QueryParameter;
+use anydb_shared::driver::statement::TypedValue;
+
+/// Bind request section shared by both extended flows: parameter format
+/// list (every parameter binary), values with their lengths (`-1` never
+/// sends value bytes), minus portal/statement names and result formats.
+fn bind_param_section(params: &[QueryParameter]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&(params.len() as i16).to_be_bytes());
+    for _ in params {
+        payload.extend_from_slice(&1i16.to_be_bytes());
+    }
+    payload.extend_from_slice(&(params.len() as i16).to_be_bytes());
+    for param in params {
+        match param_binary(param) {
+            Some(bytes) => {
+                payload.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
+                payload.extend(bytes);
+            }
+            None => payload.extend_from_slice(&(-1i32).to_be_bytes()),
+        }
+    }
+    payload
+}
+
+/// `Parse` payload for the unnamed statement: sql plus declared parameter
+/// type OIDs.
+fn parse_message_payload(sql: &str, params: &[QueryParameter]) -> Vec<u8> {
+    let mut parse_payload = vec![0u8];
+    parse_payload.extend_from_slice(sql.as_bytes());
+    parse_payload.push(0);
+    parse_payload.extend_from_slice(&(params.len() as i16).to_be_bytes());
+    for param in params {
+        parse_payload.extend_from_slice(&param_type_oid(param).to_be_bytes());
+    }
+    parse_payload
+}
 
 use crate::auth::{self, ScramClient};
+use crate::types;
 use crate::url::{PostgresTarget, SslMode};
 
 /// Postgres type OIDs for the SPI parameter set (binary-format encoding).
@@ -65,6 +102,23 @@ fn param_binary(param: &QueryParameter) -> Option<Vec<u8>> {
 pub struct ExtendedResult {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<Option<String>>>,
+    pub command_tag: Option<String>,
+    pub affected_rows: Option<i64>,
+}
+
+/// One described column of a typed execution.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColumnMeta {
+    pub name: String,
+    pub oid: i32,
+}
+
+/// One typed-query execution outcome: described columns with their OIDs,
+/// typed values per row (NULL is `None`), and the command tag metadata.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedResult {
+    pub columns: Vec<ColumnMeta>,
+    pub rows: Vec<Vec<Option<TypedValue>>>,
     pub command_tag: Option<String>,
     pub affected_rows: Option<i64>,
 }
@@ -578,6 +632,94 @@ fn parse_data_row(payload: &[u8]) -> Result<Vec<Option<String>>, ConnectionError
     Ok(values)
 }
 
+/// RowDescription with the fields the typed flow needs: name plus type OID
+/// (table oid, attribute number, type size, type modifier and format code
+/// are skipped over).
+fn parse_row_description_full(payload: &[u8]) -> Result<Vec<ColumnMeta>, ConnectionError> {
+    if payload.len() < 2 {
+        return Err(ConnectionError::Protocol(
+            "truncated row description".to_owned(),
+        ));
+    }
+    let count = i16::from_be_bytes(slice2(&payload[0..2])?);
+    let mut columns = Vec::with_capacity(count.max(0) as usize);
+    let mut i = 2;
+    for _ in 0..count.max(0) {
+        let Some(offset) = payload
+            .get(i..)
+            .and_then(|rest| rest.iter().position(|byte| *byte == 0))
+        else {
+            return Err(ConnectionError::Protocol(
+                "truncated row description".to_owned(),
+            ));
+        };
+        let end = i + offset;
+        let name = String::from_utf8_lossy(&payload[i..end]).into_owned();
+        // table oid (4) + attribute (2), then the type oid.
+        let type_start = end + 1 + 4 + 2;
+        if type_start + 4 > payload.len() {
+            return Err(ConnectionError::Protocol(
+                "truncated row description".to_owned(),
+            ));
+        }
+        let oid = i32::from_be_bytes(slice4(&payload[type_start..type_start + 4])?);
+        columns.push(ColumnMeta { name, oid });
+        // type oid (4) + size (2) + modifier (4) + format (2).
+        i = type_start + 12;
+    }
+    Ok(columns)
+}
+
+/// Data row with typed values: column count, then per column an i32 length
+/// (`-1` = NULL) and the value bytes in the format previously requested for
+/// that column.
+fn parse_typed_data_row(
+    payload: &[u8],
+    columns: &[ColumnMeta],
+    formats: &[i16],
+) -> Result<Vec<Option<TypedValue>>, ConnectionError> {
+    if payload.len() < 2 {
+        return Err(ConnectionError::Protocol("truncated data row".to_owned()));
+    }
+    let count = i16::from_be_bytes(slice2(&payload[0..2])?);
+    if count.max(0) as usize != columns.len() {
+        return Err(ConnectionError::Protocol(
+            "data row column count does not match the description".to_owned(),
+        ));
+    }
+    let mut values = Vec::with_capacity(columns.len());
+    let mut i = 2;
+    for index in 0..columns.len() {
+        if i + 4 > payload.len() {
+            return Err(ConnectionError::Protocol("truncated data row".to_owned()));
+        }
+        let len = i32::from_be_bytes(slice4(&payload[i..i + 4])?);
+        i += 4;
+        if len < 0 {
+            values.push(None);
+            continue;
+        }
+        let len = len as usize;
+        if i + len > payload.len() {
+            return Err(ConnectionError::Protocol("truncated data row".to_owned()));
+        }
+        let bytes = &payload[i..i + len];
+        let decoded = if formats[index] == 1 {
+            match types::binary_decode(columns[index].oid, bytes)? {
+                Some(value) => value,
+                // Defensive: the server overrode our binary request (an
+                // extension rewrote the type); fall back to text decoding.
+                None => types::text_decode(columns[index].oid, bytes)?,
+            }
+        } else {
+            types::text_decode(columns[index].oid, bytes)?
+        };
+        values.push(Some(decoded));
+        i += len;
+    }
+    Ok(values)
+}
+
 /// Startup negotiation on an established stream: startup packet, auth
 /// exchange, parameter capture and the initial transaction status until
 /// `ReadyForQuery`.
@@ -740,33 +882,13 @@ impl Connection {
         params: &[QueryParameter],
     ) -> Result<ExtendedResult, ConnectionError> {
         // Parse: [name\0][sql\0][i16 param count][i32 oid per param].
-        let mut parse_payload = vec![0u8];
-        parse_payload.extend_from_slice(sql.as_bytes());
-        parse_payload.push(0);
-        parse_payload.extend_from_slice(&(params.len() as i16).to_be_bytes());
-        for param in params {
-            parse_payload.extend_from_slice(&param_type_oid(param).to_be_bytes());
-        }
-        write_message(&mut self.stream, b'P', &parse_payload).await?;
+        write_message(&mut self.stream, b'P', &parse_message_payload(sql, params)).await?;
 
         // Bind: [portal\0][statement\0][param formats][param values]
         // [result formats]; every parameter is binary (1), every result is
         // text (0).
         let mut bind_payload = vec![0u8, 0u8];
-        bind_payload.extend_from_slice(&(params.len() as i16).to_be_bytes());
-        for _ in params {
-            bind_payload.extend_from_slice(&1i16.to_be_bytes());
-        }
-        bind_payload.extend_from_slice(&(params.len() as i16).to_be_bytes());
-        for param in params {
-            match param_binary(param) {
-                Some(bytes) => {
-                    bind_payload.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
-                    bind_payload.extend(bytes);
-                }
-                None => bind_payload.extend_from_slice(&(-1i32).to_be_bytes()),
-            }
-        }
+        bind_payload.extend(bind_param_section(params));
         bind_payload.extend_from_slice(&1i16.to_be_bytes());
         bind_payload.extend_from_slice(&0i16.to_be_bytes());
         write_message(&mut self.stream, b'B', &bind_payload).await?;
@@ -829,6 +951,143 @@ impl Connection {
                 other => {
                     return Err(ConnectionError::Protocol(format!(
                         "unexpected message {other} during extended query"
+                    )));
+                }
+            }
+        }
+    }
+
+    /// Typed execution: describes the unnamed statement first
+    /// (`Parse -> Describe statement -> Flush`) so column OIDs are known
+    /// before `Bind` — cataloged types are requested in binary format (1),
+    /// the rest stay text (0). The execution phase is `Bind -> Execute ->
+    /// Sync`; the portal does not need a second `Describe`. NULL keeps its
+    /// `-1` sentinel; a mid-flow error is drained until `Z` with the
+    /// statement closed by `Sync`, so the reconnect is not required.
+    pub async fn typed_query(
+        &mut self,
+        sql: &str,
+        params: &[QueryParameter],
+    ) -> Result<TypedResult, ConnectionError> {
+        write_message(&mut self.stream, b'P', &parse_message_payload(sql, params)).await?;
+        write_message(&mut self.stream, b'D', b"S\0").await?;
+        write_message(&mut self.stream, b'H', &[]).await?;
+
+        let mut columns: Vec<ColumnMeta> = Vec::new();
+        loop {
+            let (tag, payload) = read_message(&mut self.stream).await?;
+            match tag {
+                // ParseComplete, ParameterDescription.
+                b'1' | b't' => {}
+                b'T' => {
+                    columns = parse_row_description_full(&payload)?;
+                    break;
+                }
+                // NoData for statements that do not return rows.
+                b'n' => break,
+                // Notice, BackendKeyData, ParameterStatus,
+                // NegotiateProtocolVersion.
+                b'N' | b'K' | b'S' | b'v' => {}
+                b'E' => {
+                    // Close the aborted implicit transaction with `Sync`
+                    // and drain until `Z` so the connection stays usable.
+                    let error = runtime_error_response(&payload);
+                    write_message(&mut self.stream, b'S', &[]).await?;
+                    let mut runtime_error = Some(error);
+                    loop {
+                        let (tag, payload) = read_message(&mut self.stream).await?;
+                        match tag {
+                            b'N' | b'K' | b'S' | b'v' | b'1' | b'2' | b't' | b'C' | b'D' => {}
+                            b'Z' => {
+                                let byte = payload.first().copied().unwrap_or(b'I');
+                                self.txn_status = status_from_byte(byte)?;
+                                return Err(runtime_error.take().expect("set above"));
+                            }
+                            other => {
+                                return Err(ConnectionError::Protocol(format!(
+                                    "unexpected message {other} after describe error"
+                                )));
+                            }
+                        }
+                    }
+                }
+                other => {
+                    return Err(ConnectionError::Protocol(format!(
+                        "unexpected message {other} during statement describe"
+                    )));
+                }
+            }
+        }
+
+        // Result format per column: binary where the catalog supports it.
+        let formats: Vec<i16> = columns
+            .iter()
+            .map(|column| {
+                if types::binary_supported(column.oid) {
+                    1
+                } else {
+                    0
+                }
+            })
+            .collect();
+
+        // Bind: every parameter binary; result formats follow the catalog.
+        let mut bind_payload = vec![0u8, 0u8];
+        bind_payload.extend(bind_param_section(params));
+        bind_payload.extend_from_slice(&(formats.len() as i16).to_be_bytes());
+        for format in &formats {
+            bind_payload.extend_from_slice(&(*format).to_be_bytes());
+        }
+        write_message(&mut self.stream, b'B', &bind_payload).await?;
+
+        // Execute: all rows, no PortalSuspended path.
+        let mut execute_payload = vec![0u8];
+        execute_payload.extend_from_slice(&0i32.to_be_bytes());
+        write_message(&mut self.stream, b'E', &execute_payload).await?;
+        write_message(&mut self.stream, b'S', &[]).await?;
+
+        let mut result = TypedResult {
+            columns,
+            rows: Vec::new(),
+            command_tag: None,
+            affected_rows: None,
+        };
+        let mut runtime_error: Option<ConnectionError> = None;
+        loop {
+            let (tag, payload) = read_message(&mut self.stream).await?;
+            match tag {
+                // ParseComplete, BindComplete, ParameterDescription, NoData,
+                // and a portal `Describe` would re-send its row description.
+                b'1' | b'2' | b't' | b'n' | b'T' => {}
+                b'D' => {
+                    let row = parse_typed_data_row(&payload, &result.columns, &formats)?;
+                    result.rows.push(row);
+                }
+                b'C' => {
+                    result.command_tag = Some(parse_command_tag(&payload));
+                    result.affected_rows =
+                        result.command_tag.as_deref().and_then(tag_affected_rows);
+                }
+                b'N' | b'K' | b'S' | b'v' => {}
+                b'E' => {
+                    runtime_error = Some(runtime_error_response(&payload));
+                }
+                b'Z' => {
+                    let byte = payload.first().copied().unwrap_or(b'I');
+                    self.txn_status = status_from_byte(byte)?;
+                    if let Some(error) = runtime_error {
+                        return Err(error);
+                    }
+                    return Ok(result);
+                }
+                b's' => {
+                    return Err(ConnectionError::Protocol(
+                        "unexpected PortalSuspended (max_rows=0)".to_owned(),
+                    ));
+                }
+                other => {
+                    return Err(ConnectionError::Protocol(format!(
+                        "unexpected message {other} during typed query"
                     )));
                 }
             }
