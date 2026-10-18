@@ -1,11 +1,15 @@
 #![forbid(unsafe_code)]
 //! MongoDB driver skeleton: same contract as `anydb-postgres`; declared
 //! thread-safe is `false` on purpose so the serialized statement gate path
-//! (`SingleThreadLock` analog) is exercised from day one.
+//! (`SingleThreadLock` analog) is exercised from day one. The `bson`
+//! module carries the typed-mapping foundation (parser + `TypedValue`
+//! rules) for the future wire layer.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
+
+pub mod bson;
 
 use anydb_shared::ConnectionError;
 use anydb_shared::driver::descriptor::DriverDescriptor;
