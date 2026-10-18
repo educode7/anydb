@@ -5,4 +5,5 @@
 pub mod in_memory_registry;
 pub mod in_memory_secrets;
 pub mod job_queue;
+pub mod monitor;
 pub mod noop_events;

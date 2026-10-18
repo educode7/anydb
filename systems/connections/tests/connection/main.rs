@@ -2,4 +2,5 @@
 
 mod connect_lifecycle;
 mod job_queue;
+mod monitor;
 mod support;

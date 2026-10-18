@@ -174,6 +174,76 @@ impl NetworkHandler for TunnelHandler {
     }
 }
 
+pub struct PingDriver {
+    descriptor: DriverDescriptor,
+    opens: Arc<AtomicUsize>,
+    pings: Arc<AtomicUsize>,
+    fail_ping: bool,
+}
+
+impl PingDriver {
+    /// Returns the driver plus shared counters for opens and pings.
+    pub fn new(fail_ping: bool) -> (Arc<Self>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let opens = Arc::new(AtomicUsize::new(0));
+        let pings = Arc::new(AtomicUsize::new(0));
+        (
+            Arc::new(Self {
+                descriptor: DriverDescriptor::new("ping", "Ping", true),
+                opens: opens.clone(),
+                pings: pings.clone(),
+                fail_ping,
+            }),
+            opens,
+            pings,
+        )
+    }
+}
+
+#[async_trait]
+impl Driver for PingDriver {
+    fn descriptor(&self) -> &DriverDescriptor {
+        &self.descriptor
+    }
+
+    async fn open_data_source(
+        &self,
+        _request: OpenRequest,
+    ) -> Result<Arc<dyn DataSource>, ConnectionError> {
+        self.opens.fetch_add(1, Ordering::SeqCst);
+        Ok(Arc::new(PingSource {
+            pings: self.pings.clone(),
+            fail: self.fail_ping,
+        }))
+    }
+}
+
+struct PingSource {
+    pings: Arc<AtomicUsize>,
+    fail: bool,
+}
+
+#[async_trait]
+impl DataSource for PingSource {
+    fn metadata(&self) -> DataSourceMetadata {
+        DataSourceMetadata {
+            product_name: "Ping".to_owned(),
+            product_version: "0".to_owned(),
+            driver_name: "ping".to_owned(),
+        }
+    }
+
+    async fn ping(&self) -> Result<(), ConnectionError> {
+        self.pings.fetch_add(1, Ordering::SeqCst);
+        if self.fail {
+            Err(ConnectionError::NetworkFailure)
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn close(&self) {}
+}
+
 pub fn module_with_secrets(secrets: Arc<dyn SecretsStore>) -> Arc<ConnectionModule> {
     let clock: Arc<dyn Clock> = Arc::new(anydb_shared::ports::SystemClock);
     ConnectionModule::new(

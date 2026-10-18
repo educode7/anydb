@@ -9,7 +9,7 @@
 //! injected ports.
 
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 
 use tokio::task::JoinSet;
 
@@ -18,6 +18,9 @@ use anydb_connections::connection::application::commands::connect::ConnectOutcom
 use anydb_connections::connection::application::dtos::container_status_dto::ContainerStatusDto;
 use anydb_connections::connection::application::jobs::ConnectionJob;
 use anydb_connections::connection::infrastructure::job_queue::BoundJobQueue;
+use anydb_connections::connection::infrastructure::monitor::{
+    KeepAliveLoopConfig, LoopHandle, spawn_keepalive_loop,
+};
 use anydb_connections::execution::application::commands::execute_with_recovery::RecoveryRunner;
 use anydb_connections::execution::domain::ports::invalidation_target::InvalidationTarget;
 use anydb_connections::execution::domain::value_objects::recovery_policy::RecoveryPolicy;
@@ -45,6 +48,7 @@ pub mod prelude {
     pub use anydb_connections::connection::infrastructure::in_memory_registry::ContainerRegistry;
     pub use anydb_connections::connection::infrastructure::in_memory_secrets::InMemorySecretsStore;
     pub use anydb_connections::connection::infrastructure::job_queue::BoundJobQueue;
+    pub use anydb_connections::connection::infrastructure::monitor::KeepAliveLoopConfig;
     pub use anydb_connections::connection::infrastructure::noop_events::NoOpEvents;
     pub use anydb_connections::execution::application::commands::execute_with_recovery::RecoveryRunner;
     pub use anydb_connections::execution::domain::ports::error_classifier::ErrorClassifier;
@@ -64,8 +68,11 @@ pub struct App {
     queue: BoundJobQueue,
     recovery_policy: RecoveryPolicy,
     /// Supervised background tasks (job worker, keepalive loops). Shutdown
-    /// drains this set; nothing is spawned detached.
-    tasks: JoinSet<()>,
+    /// drains this set; nothing is spawned detached. Std mutex: `spawn` is
+    /// `&self`, no await is ever held while locked.
+    tasks: StdMutex<JoinSet<()>>,
+    /// Cancel handles for spawned background loops.
+    loops: StdMutex<Vec<LoopHandle>>,
 }
 
 impl App {
@@ -86,12 +93,26 @@ impl App {
             module,
             queue,
             recovery_policy: RecoveryPolicy::default(),
-            tasks,
+            tasks: StdMutex::new(tasks),
+            loops: StdMutex::new(Vec::new()),
         }
     }
 
     pub fn set_recovery_policy(&mut self, policy: RecoveryPolicy) {
         self.recovery_policy = policy;
+    }
+
+    /// Spawns a supervised keepalive sweep (DBeaver `KeepAlivePingJob`
+    /// analog). The handle is stored so `shutdown` cancels it.
+    pub fn spawn_keepalive_loop(&self, config: KeepAliveLoopConfig) {
+        let handle = {
+            let mut tasks = self.tasks.lock().unwrap_or_else(PoisonError::into_inner);
+            spawn_keepalive_loop(&self.module, config, &mut tasks)
+        };
+        self.loops
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(handle);
     }
 
     /// Declares a container backed by a driver and its pipeline config.
@@ -176,11 +197,20 @@ impl App {
         }
     }
 
-    /// Graceful shutdown: finalize supervised background tasks. Dropping the
-    /// queue first closes the sender so the worker can exit.
-    pub async fn shutdown(mut self) {
+    /// Graceful shutdown: cancel background loops, close the queue and the
+    /// module (their tasks hold `Weak` and exit), then drain the task set.
+    pub async fn shutdown(self) {
+        self.loops
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
         drop(self.queue);
-        while let Some(task) = self.tasks.join_next().await {
+        drop(self.module);
+        let mut tasks = self
+            .tasks
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner);
+        while let Some(task) = tasks.join_next().await {
             if let Err(error) = task {
                 tracing::debug!(?error, "background task ended abnormally");
             }
