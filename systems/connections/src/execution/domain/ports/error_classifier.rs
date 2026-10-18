@@ -1,8 +1,6 @@
 //! Error type classifier port (DBeaver driver `DBPErrorAssistant` analog).
+//!
+//! The contract lives in the shared kernel so drivers can implement it
+//! without depending on this system; the port is the system-local alias.
 
-use anydb_shared::{ConnectionError, ErrorType};
-
-/// Sync by design: classification is cheap and must not suspend.
-pub trait ErrorClassifier: Send + Sync {
-    fn classify(&self, error: &ConnectionError) -> ErrorType;
-}
+pub use anydb_shared::driver::classification::ErrorClassifier;

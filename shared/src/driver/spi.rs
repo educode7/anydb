@@ -6,10 +6,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use super::classification::ErrorClassifier;
 use super::descriptor::DriverDescriptor;
 use super::statement::{QueryParameter, StatementResult};
 use crate::ConnectionError;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenRequest {
     pub container_id: String,
@@ -28,6 +28,13 @@ pub struct DataSourceMetadata {
 #[async_trait]
 pub trait Driver: Send + Sync {
     fn descriptor(&self) -> &DriverDescriptor;
+
+    /// DBeaver per-driver `discoverErrorType` override analog: classifiers
+    /// that decode driver-native error payloads (PostgreSQL: SQLSTATE).
+    /// `None` selects the kernel's conservative classification.
+    fn error_classifier(&self) -> Option<Arc<dyn ErrorClassifier>> {
+        None
+    }
 
     /// Factory seam decoupling connection creation from the registry.
     async fn open_data_source(
