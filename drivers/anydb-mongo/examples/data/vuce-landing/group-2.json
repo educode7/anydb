@@ -1,0 +1,61 @@
+{
+  "codeGroup": "2",
+  "name": "GESTIÓN EMPRESARIAL",
+  "isActive": "1",
+  "listComponent": [
+    {
+      "codeComponent": "1",
+      "component": null,
+      "name": "Perú Marketplace <br> (Tienda Virtual)",
+      "description": "Exhibe tus productos en el mundo",
+      "authenticationUrl": "https://www.perumarketplace.com/",
+      "authenticationContingencyUrl": "https://www.perumarketplace.com/",
+      "detailUrl": "https://www.vuce.gob.pe/Paginas/Tienda-Virtual-B2B.aspx",
+      "image": "assets/images/Imagenes_Componentes/peru-market-place.png",
+      "icon": "assets/images/Iconos_Landing_Componentes/market-place.svg",
+      "iconSharepoint": "/svg/market-place.svg",
+      "isActive": "1",
+      "codeGroup": "2",
+      "categoryProfile": null,
+      "authenticationType": "AUTH1",
+      "hasModal": "false",
+      "modalOptions": null
+    },
+    {
+      "codeComponent": "2",
+      "component": null,
+      "name": "Gestión Empresarial <br> E-PYMEX",
+      "description": "Gestiona la información de tus operaciones de comercio exterior",
+      "authenticationUrl": "https://e-pymex.gob.pe/",
+      "authenticationContingencyUrl": "https://e-pymex.gob.pe/",
+      "detailUrl": "https://www.vuce.gob.pe/Paginas/Gestion-empresarial-PIMEX.aspx",
+      "image": "assets/images/Imagenes_Componentes/getion-empresarial-epymex.png",
+      "icon": "assets/images/Iconos_Landing_Componentes/gestion-empresarial.svg",
+      "iconSharepoint": "/svg/gestion-empresarial.svg",
+      "isActive": "1",
+      "codeGroup": "2",
+      "categoryProfile": null,
+      "authenticationType": "AUTH1",
+      "hasModal": "false",
+      "modalOptions": null
+    },
+    {
+      "codeComponent": "3",
+      "component": null,
+      "name": "Ruta Productiva <br> Exportadora",
+      "description": "Fortalece tus capacidades en desarrollo productivo, gestión empresarial y comercio exterior",
+      "authenticationUrl": "https://www.rpe.pe/",
+      "authenticationContingencyUrl": "https://www.rpe.pe/",
+      "detailUrl": "https://www.vuce.gob.pe/Paginas/RPE.aspx",
+      "image": "assets/images/Imagenes_Componentes/ruta-productiva-exportadora.png",
+      "icon": "assets/images/Iconos_Landing_Componentes/ruta-productiva-exportadora.svg",
+      "iconSharepoint": "/svg/ruta-productiva-exportadora.svg",
+      "isActive": "1",
+      "codeGroup": "2",
+      "categoryProfile": null,
+      "authenticationType": "AUTH1",
+      "hasModal": "false",
+      "modalOptions": null
+    }
+  ]
+}
