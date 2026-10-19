@@ -115,8 +115,8 @@ The consumer (`auth-landing-componentes-api`) reads with `findByIsActiveEquals("
   (ModelMapper), so no Java change is required; only the data is missing.
 - L4 (evidence): `auth-landing-componentes-api/src/main/resources/application.yaml` points at
   `mongodb://localhost:27018/vuce-landingz` (container `landing-api`, empty) while the seed target
-  chosen in L2 is `anydb-mongo` on 27017. **Open:** the yaml must be repointed for the API to read
-  the seeded data; raised with the user at delivery, not changed unilaterally.
+  chosen in L2 is `anydb-mongo` on 27017. **Discarded by the user in L13**: the yaml is not
+  repointed, and was never changed unilaterally.
 - L5 (evidence): UI semantics confirmed in `contingency-option.ts` — only `AUTH2` and
   `AUTH1_AUTH2` depend on the contingency flag, `AUTH1`/absent take the normal flow, so the S5
   default of `AUTH1` does not alter behavior for the components that had `null`.
@@ -181,3 +181,10 @@ The consumer (`auth-landing-componentes-api`) reads with `findByIsActiveEquals("
     the ff required no second merge commit), then pushed to `origin/main`.
   - The branch `feature/mongo-insert-statement` remains local at the same commit; it was not pushed
     because `main` already carries every commit.
+- L13 (2026-10-19, decision, verbatim): "descartar el punto 2.auth-landing-componentes-api apunta
+  a 27018/vuce-landingz". The consumer configuration is left exactly as it is — no change to
+  `application.yaml`. Consequence, recorded so it is not rediscovered later: the API keeps reading
+  `mongodb://localhost:27018/vuce-landingz` (container `landing-api`, which is empty), so it will
+  not serve the documents seeded into `mongodb://localhost:27017/vuce-landing`. Those three
+  documents stand as the fixture and live proof of the `insert` statement, not as data the API
+  consumes. This closes every open item of the feature.
