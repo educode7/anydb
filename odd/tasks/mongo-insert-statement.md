@@ -159,3 +159,10 @@ The consumer (`auth-landing-componentes-api`) reads with `findByIsActiveEquals("
   `1fc6a34` was verified in isolation (everything else stashed, then `cargo test -p anydb-mongo`:
   64 lib + 31 integration tests, exit 0); from `9d80eb1` on, `src/` and `tests/` are byte-identical
   to the state the workspace gates ran green on. Working tree clean at `06d52b8`.
+- L11 (2026-10-19, open): `main` advanced past the branch cut point (`bd7fa20`) with `36cb935`
+  (SPI transaction control) and `bd7fa20` (README + LICENSE). `36cb935` touches
+  `drivers/anydb-mongo/src/lib.rs` with a 3-line module-doc addition at the SAME anchor where this
+  feature inserted its doc paragraph, so `git merge-tree` reports "changed in both": a rebase would
+  hit a trivial doc-comment conflict (main's added lines are a note that ACID transactions are not
+  wired for mongo; this feature's are the `insert` statement paragraph — both belong). The branch is
+  NOT rebased or merged; the hashes above stand until the user decides.
