@@ -152,8 +152,8 @@ fn source_for(port: u16) -> impl Future<Output = std::sync::Arc<WireDataSource>>
 
 // ---------- server-side matcher (only what the scripts exercise) -------
 
-/// Top-level `$or`/`$and` keys are mongo's connective operators; any
-/// other key applies its operator condition to the field value. A
+/// Top-level `$or`/`$and`/`$nor` keys are mongo's connective operators;
+/// any other key applies its operator condition to the field value. A
 /// scalar condition is equality (mongo's natural shorthand).
 fn matches_filter(filter: &Document, document: &Document) -> bool {
     filter.iter().all(|(path, condition)| match path.as_str() {
@@ -161,6 +161,14 @@ fn matches_filter(filter: &Document, document: &Document) -> bool {
             Bson::Array(branches) => branches.iter().any(|branch| match branch {
                 Bson::Document(branch_document) => matches_filter(branch_document, document),
                 _ => false,
+            }),
+            _ => false,
+        },
+        // A `$nor` holds when no branch matches.
+        "$nor" => match condition {
+            Bson::Array(branches) => branches.iter().all(|branch| match branch {
+                Bson::Document(branch_document) => !matches_filter(branch_document, document),
+                _ => true,
             }),
             _ => false,
         },
@@ -212,6 +220,15 @@ fn match_op(op: &str, value: Option<&Bson>, operand: &Bson) -> bool {
     match op {
         "$eq" => value.is_some_and(|value| values_equal(value, operand)),
         "$ne" => !value.is_some_and(|value| values_equal(value, operand)),
+        // `$not` inverts exactly one operator expression: the negation
+        // of a missing field is true (mongo matches absent fields).
+        "$not" => match operand {
+            Bson::Document(inner) => match inner.iter().next() {
+                Some((inner_op, inner_operand)) => !match_op(inner_op, value, inner_operand),
+                None => false,
+            },
+            _ => false,
+        },
         "$in" => match operand {
             Bson::Array(list) => {
                 value.is_some_and(|value| list.iter().any(|item| values_equal(value, item)))
@@ -636,6 +653,57 @@ async fn or_filters_match_either_branch_server_side() {
         })
         .collect();
     assert_eq!(numbers, vec![1, 3], "each branch contributes its matches");
+
+    server.await.expect("server task");
+}
+
+#[tokio::test]
+async fn not_filters_negate_server_side() {
+    let dataset = vec![
+        doc_n(1, "a", true),
+        doc_n(2, "a", false),
+        doc_n(3, "b", true),
+        doc_n(4, "d", false),
+    ];
+    let (port, server) = spawn_server(move |stream| {
+        // `flag = true and not (n > 3 or tag = 'b')` compiles to the
+        // merged flag slot plus one `$nor` branch document beside it.
+        filter_find_server(
+            stream,
+            Bson::Document(vec![
+                ("flag".to_owned(), Bson::Boolean(true)),
+                (
+                    "$nor".to_owned(),
+                    Bson::Array(vec![
+                        Bson::Document(vec![(
+                            "n".to_owned(),
+                            Bson::Document(vec![("$gt".to_owned(), Bson::Int32(3))]),
+                        )]),
+                        Bson::Document(vec![("tag".to_owned(), Bson::String("b".to_owned()))]),
+                    ]),
+                ),
+            ]),
+            dataset,
+            1,
+        )
+    });
+    let source = source_for(port).await;
+
+    let typed = source
+        .execute_statement_typed("find c1 with flag = true and not (n > 3 or tag = 'b')", &[])
+        .await
+        .expect("typed execution");
+    // flag=true keeps n1, n3; the $nor drops tag='b' (n3) and n>3 off
+    // the candidates, leaving exactly n1.
+    let numbers: Vec<i32> = typed
+        .rows
+        .iter()
+        .map(|row| match &row[0] {
+            Some(TypedValue::Int4(n)) => *n,
+            other => panic!("unexpected number value {other:?}"),
+        })
+        .collect();
+    assert_eq!(numbers, vec![1]);
 
     server.await.expect("server task");
 }

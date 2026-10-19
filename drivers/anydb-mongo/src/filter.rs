@@ -6,14 +6,15 @@
 //! so this is the jdbc-bind analog), never by string interpolation:
 //! injection-safe by construction.
 //!
-//! Grammar (v2 adds parenthesized groups and `or`; `not` remains an
-//! explicit protocol error, never ignored):
+//! Grammar (v3 adds unary `not`; `and` binds tighter than `or`, `not`
+//! binds tighter than both):
 //!
 //! ```text
 //! filter     := or_expr
 //! or_expr    := and_expr ('or' and_expr)*        // lowest precedence
 //! and_expr   := atom ( ('and' | ',') atom )*
-//! atom       := '(' or_expr ')' | predicate
+//! atom       := 'not'* core                      // parity-folded in place
+//! core       := '(' or_expr ')' | predicate
 //! predicate  := path op value | path 'in' '(' (value (',' value)*)? ')'
 //! op         := '=' | '!=' | '<' | '<=' | '>' | '>=' | 'in'
 //! value      := number | string | true | false | null | '?' (param)
@@ -22,34 +23,42 @@
 //! ```
 //!
 //! `and` binds tighter than `or` (`a = 1 and b = 2 or c = 3` is
-//! `{a=1, b=2} or {c=3}`). Parenthesized groups cut anywhere; nesting
-//! is capped at 16 levels and an empty group is an error. Literals:
-//! integers become `Int32` when they fit (mongo shell convention),
-//! `Int64` when they do not; decimal/exponent forms become `Double`.
-//! Keywords are case-insensitive. `?` placeholders bind positionally
-//! to the statement parameters (in first-seen order across all
-//! branches): `Integer` maps to `Int64` (mongo compares numerically
-//! across widths), `Float` to `Double`, `Text` to `String`, `Binary`
-//! to `Binary`, `Boolean` to `Boolean`, `Null` to `null`. A literal
-//! `?` character cannot exist unquoted in filter text.
+//! `{a=1, b=2} or {c=3}`); `not` binds tightest (`not a = 1 or b = 2`
+//! negates only `a = 1`). A leading field named exactly `not` is
+//! reserved — a dotted segment may still be named `not`. Parenthesized
+//! groups cut anywhere; nesting is capped at 16 levels and an empty
+//! group is an error. Literals: integers become `Int32` when they fit
+//! (mongo shell convention), `Int64` when they do not; decimal/exponent
+//! forms become `Double`. Keywords are case-insensitive. `?`
+//! placeholders bind positionally to the statement parameters (in
+//! first-seen order across all branches): `Integer` maps to `Int64`
+//! (mongo compares numerically across widths), `Float` to `Double`,
+//! `Text` to `String`, `Binary` to `Binary`, `Boolean` to `Boolean`,
+//! `Null` to `null`. A literal `?` character cannot exist unquoted in
+//! filter text.
 //!
 //! Compiling: a conjunctive run of predicates on the same path merges
 //! into ONE operator document (`n > 1 and n < 5` becomes
 //! `{n: {$gt: 1, $lt: 5}}`, mongo's canonical range shape; a lone
 //! equality keeps the natural shorthand `{n: 3}`); equality sharing a
 //! path with a range renders through `$eq`; a second equality, a
-//! repeated operator, or an `in` next to anything else on the same
-//! path is a conflict error instead of a silently contradictory or
-//! ambiguous filter. `or` renders as the mongo `$or` top-level key
-//! over compiled branch documents — a conflict-free single branch
-//! stays a plain document (no `$or` wrapper for one alternative). An
-//! `and` chain mixing predicates with TWO or more parenthesized
-//! alternatives wraps the extra branch documents under mongo's
-//! `$and`; one alternative sits directly beside the merged fields.
-//! Because paths reject `$` at the tokenizer, compiled `$or`/`$and`
-//! keys can never collide with field names. Merge/conflict checks
-//! apply within each conjunctive run: predicates equal by text but in
-//! different or-branches are independent and merge freely.
+//! repeated operator, an `in` next to anything else on the same path,
+//! or an equality contradicting its own negation is a conflict error
+//! instead of a silently contradictory or ambiguous filter. `or`
+//! renders as the mongo `$or` top-level key over compiled branch
+//! documents — a conflict-free single branch stays a plain document
+//! (no `$or` wrapper for one alternative). An `and` chain mixing
+//! predicates with TWO or more parenthesized alternatives wraps the
+//! extra branch documents under mongo's `$and`; one alternative sits
+//! directly beside the merged fields. A negated predicate merges as an
+//! operator slot beside positive siblings (`a = 1 and not a > 2`
+//! becomes `{a: {$eq: 1, $not: {$gt: 2}}}`); negating an `or` renders
+//! mongo's `$nor`; negating an `and` applies de Morgan as an `$or`
+//! over the negated conjuncts. Because paths reject `$` at the
+//! tokenizer, compiled `$or`/`$and`/`$not`/`$nor` keys can never
+//! collide with field names. Merge/conflict checks apply within each
+//! conjunctive run: predicates equal by text but in different
+//! or-branches are independent and merge freely.
 
 use crate::bson::{Bson, Document};
 use anydb_shared::ConnectionError;
@@ -59,7 +68,9 @@ fn protocol(message: String) -> ConnectionError {
     ConnectionError::Protocol(format!("mongo filter: {message}"))
 }
 
-/// One comparison operation of a predicate.
+/// One comparison operation of a predicate. `Not` is render-only: the
+/// parser never yields it; the compile of unary `not` slots it so a
+/// negated predicate merges beside sibling operators on its path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Op {
     Eq,
@@ -69,6 +80,7 @@ enum Op {
     Gt,
     Ge,
     In,
+    Not,
 }
 
 impl Op {
@@ -82,6 +94,7 @@ impl Op {
             Self::Gt => "$gt",
             Self::Ge => "$gte",
             Self::In => "$in",
+            Self::Not => "$not",
         }
     }
 }
@@ -106,7 +119,7 @@ struct Predicate {
 }
 
 /// One node of the grammatical precedence tree: `and` chains merge
-/// per-path, `or` chains take branch documents.
+/// per-path, `or` chains take branch documents, `not` negates its child.
 #[derive(Debug, Clone, PartialEq)]
 enum Node {
     /// All children must match (an `and` chain or a bare predicate
@@ -114,6 +127,8 @@ enum Node {
     And(Vec<Node>),
     /// At least one child must match.
     Or(Vec<Node>),
+    /// Negated child; consecutive `not`s fold by parity at parse time.
+    Not(Box<Node>),
     Pred(Predicate),
 }
 
@@ -168,6 +183,9 @@ impl Filter {
                 merge_into(&mut merged, node, params)?;
                 Ok(render_merged(merged))
             }
+            // Parity is folded at parse time, so the child is never a
+            // `Not`; render its complement once.
+            Node::Not(inner) => self.compile_negated(inner, params),
             Node::Or(children) => {
                 let mut branches = Vec::new();
                 for child in children {
@@ -180,7 +198,13 @@ impl Filter {
                 let mut groups: Vec<Document> = Vec::new();
                 for child in children {
                     match child {
+                        // `not <predicate>` is an operator slot beside
+                        // positive siblings; any negated group compiles
+                        // to its own branch document.
                         Node::Pred(_) => merge_into(&mut merged, child, params)?,
+                        Node::Not(inner) if matches!(inner.as_ref(), Node::Pred(_)) => {
+                            merge_into(&mut merged, child, params)?;
+                        }
                         other => groups.push(self.compile(other, params)?),
                     }
                 }
@@ -205,73 +229,210 @@ impl Filter {
             }
         }
     }
+
+    /// Renders the COMPLEMENT of a node: `¬node`. A field predicate
+    /// negates in place (`{path: {$not: {...}}}`), an `or` negates into
+    /// mongo's `$nor` (no branch holds, so the branches keep their
+    /// plain compile), and an `and` negates by de Morgan as an `$or`
+    /// over the negated conjuncts (`¬child` for each). A leading
+    /// `Node::Not` child folds back to the plain compile (`¬¬x = x`);
+    /// nested `$or`/`$nor` keys cannot collide with fields because
+    /// paths reject `$` at the tokenizer.
+    fn compile_negated(
+        &self,
+        node: &Node,
+        params: &[QueryParameter],
+    ) -> Result<Document, ConnectionError> {
+        match node {
+            // ¬(¬x) = x — and a plain predicate must merge NEGATIVELY,
+            // so it travels wrapped in a `Not` for the merge rules.
+            Node::Not(inner) => self.compile(inner, params),
+            Node::Pred(_) => {
+                let negated = Node::Not(Box::new(node.clone()));
+                let mut merged = Vec::new();
+                merge_into(&mut merged, &negated, params)?;
+                Ok(render_merged(merged))
+            }
+            // ¬(a or b) — `$nor` matches documents where NONE of the
+            // conditions hold, so the branches are the plain compiles.
+            Node::Or(children) => {
+                let mut branches = Vec::new();
+                for child in children {
+                    branches.push(Bson::Document(self.compile(child, params)?));
+                }
+                Ok(vec![("$nor".to_owned(), Bson::Array(branches))])
+            }
+            // ¬(a and b) = ¬a or ¬b — every conjunct negates into its
+            // own alternative branch.
+            Node::And(children) => {
+                let mut branches = Vec::new();
+                for child in children {
+                    branches.push(Bson::Document(self.compile_negated(child, params)?));
+                }
+                Ok(vec![("$or".to_owned(), Bson::Array(branches))])
+            }
+        }
+    }
 }
 
-/// Applies one predicate to the per-path merge state (binding its
-/// values first): the conflict rules — repeated operators, `in`
-/// sharing a path with another operator, double `in`.
+/// Applies one predicate (possibly negated) to the per-path merge state
+/// (binding its values first): the conflict rules — repeated operators,
+/// `in` sharing a path with another operator, double `in`, repeated
+/// `$not`, and an equality contradicting its own negation.
 fn merge_into(
     merged: &mut Vec<Merged>,
     node: &Node,
     params: &[QueryParameter],
 ) -> Result<(), ConnectionError> {
-    let Node::Pred(predicate) = node else {
-        return Err(protocol(
-            "internal: only predicates merge per path".to_owned(),
-        ));
+    // Unwrap the negation; parity is already folded at parse time.
+    let (predicate, negative) = match node {
+        Node::Pred(predicate) => (predicate, false),
+        Node::Not(inner) => match inner.as_ref() {
+            Node::Pred(predicate) => (predicate, true),
+            _ => {
+                return Err(protocol(
+                    "internal: only predicates merge per path".to_owned(),
+                ));
+            }
+        },
+        _ => {
+            return Err(protocol(
+                "internal: only predicates merge per path".to_owned(),
+            ));
+        }
     };
     let path = predicate.path.join(".");
-    match predicate.op {
-        Op::In => {
-            let values = predicate
-                .values
-                .iter()
-                .map(|value| bind_value(value, params))
-                .collect::<Result<Vec<_>, _>>()?;
-            match merged.iter_mut().find(|m| m.path == predicate.path) {
-                Some(_) => Err(protocol(format!(
-                    "conflicting 'in' predicates for path '{path}'"
-                ))),
-                None => {
-                    merged.push(Merged {
-                        path: predicate.path.clone(),
-                        slots: Vec::new(),
-                        in_list: Some(values),
-                    });
-                    Ok(())
+    if negative {
+        // The negated operand renders as the `$not` inner doc: a lone
+        // equality becomes `$eq` (the shorthand is for field position
+        // only) and `in` keeps its list form.
+        let inner = match predicate.op {
+            Op::In => {
+                let values = predicate
+                    .values
+                    .iter()
+                    .map(|value| bind_value(value, params))
+                    .collect::<Result<Vec<_>, _>>()?;
+                vec![("$in".to_owned(), Bson::Array(values))]
+            }
+            op => {
+                let value = bind_value(&predicate.value, params)?;
+                vec![(op.key().to_owned(), value.clone())]
+            }
+        };
+        match merged.iter_mut().find(|m| m.path == predicate.path) {
+            Some(entry) => {
+                if entry.in_list.is_some() {
+                    return Err(protocol(format!(
+                        "'in' and 'not' cannot share path '{path}'"
+                    )));
                 }
+                if entry.slots.iter().any(|(slot, _)| *slot == Op::Not) {
+                    return Err(protocol(format!(
+                        "repeated $not predicate for path '{path}'"
+                    )));
+                }
+                // `a = 1 and not a = 1` is the same contradiction the
+                // v1 rules refuse for two equalities.
+                if let [(key, value)] = &inner[..]
+                    && key == "$eq"
+                    && entry
+                        .slots
+                        .iter()
+                        .any(|(slot, stored)| slot == &Op::Eq && stored == value)
+                {
+                    return Err(protocol(format!(
+                        "equality contradicts 'not' at path '{path}'"
+                    )));
+                }
+                entry.slots.push((Op::Not, Bson::Document(inner)));
+                Ok(())
+            }
+            None => {
+                merged.push(Merged {
+                    path: predicate.path.clone(),
+                    slots: vec![(Op::Not, Bson::Document(inner))],
+                    in_list: None,
+                });
+                Ok(())
             }
         }
-        op => {
-            let value = bind_value(&predicate.value, params)?;
+    } else {
+        match predicate.op {
+            Op::In => {
+                let values = predicate
+                    .values
+                    .iter()
+                    .map(|value| bind_value(value, params))
+                    .collect::<Result<Vec<_>, _>>()?;
+                match merged.iter_mut().find(|m| m.path == predicate.path) {
+                    Some(_) => Err(protocol(format!(
+                        "conflicting 'in' predicates for path '{path}'"
+                    ))),
+                    None => {
+                        merged.push(Merged {
+                            path: predicate.path.clone(),
+                            slots: Vec::new(),
+                            in_list: Some(values),
+                        });
+                        Ok(())
+                    }
+                }
+            }
+            op => {
+                let value = bind_value(&predicate.value, params)?;
 
-            match merged.iter_mut().find(|m| m.path == predicate.path) {
-                Some(entry) => {
-                    if entry.in_list.is_some() {
-                        return Err(protocol(format!(
-                            "'in' and '{op_key}' cannot share path '{path}'",
-                            op_key = op.key()
-                        )));
+                match merged.iter_mut().find(|m| m.path == predicate.path) {
+                    Some(entry) => {
+                        if entry.in_list.is_some() {
+                            return Err(protocol(format!(
+                                "'in' and '{op_key}' cannot share path '{path}'",
+                                op_key = op.key()
+                            )));
+                        }
+                        if entry.slots.iter().any(|(slot, _)| *slot == op) {
+                            return Err(protocol(format!(
+                                "repeated {} predicate for path '{path}'",
+                                if op == Op::Eq { "equality" } else { op.key() }
+                            )));
+                        }
+                        // Mirror orientation: `not a = 1 and a = 1`.
+                        if op == Op::Eq
+                            && entry
+                                .slots
+                                .iter()
+                                .any(|(_, stored)| not_slot_eq_operand(stored) == Some(&value))
+                        {
+                            return Err(protocol(format!(
+                                "equality contradicts 'not' at path '{path}'"
+                            )));
+                        }
+                        entry.slots.push((op, value));
+                        Ok(())
                     }
-                    if entry.slots.iter().any(|(slot, _)| *slot == op) {
-                        return Err(protocol(format!(
-                            "repeated {} predicate for path '{path}'",
-                            if op == Op::Eq { "equality" } else { op.key() }
-                        )));
+                    None => {
+                        merged.push(Merged {
+                            path: predicate.path.clone(),
+                            slots: vec![(op, value)],
+                            in_list: None,
+                        });
+                        Ok(())
                     }
-                    entry.slots.push((op, value));
-                    Ok(())
-                }
-                None => {
-                    merged.push(Merged {
-                        path: predicate.path.clone(),
-                        slots: vec![(op, value)],
-                        in_list: None,
-                    });
-                    Ok(())
                 }
             }
         }
+    }
+}
+
+/// The inner `$eq` operand of a `$not` slot, when the negated doc holds
+/// exactly an equality (used by the contradiction check).
+fn not_slot_eq_operand(slot: &Bson) -> Option<&Bson> {
+    match slot {
+        Bson::Document(entries) => match entries[..] {
+            [(ref key, ref value)] if key == "$eq" => Some(value),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -404,13 +565,23 @@ fn parse_and(
     Ok(Node::And(children))
 }
 
-/// `('(' or_expr ')') | predicate`, with the group nesting guard.
+/// `('not')? core` — the unary folds by parity in place, so an even
+/// chain is identity and an odd chain wraps its core in `Node::Not`
+/// exactly once (consecutive `not`s never recurse into the parser).
 fn parse_atom(
     tokens: &mut Tokenizer,
     placeholders: &mut usize,
     depth: usize,
 ) -> Result<Node, ConnectionError> {
-    if matches!(tokens.peek()?, Some(Token::LParen)) {
+    let mut negations = 0usize;
+    while matches!(
+        tokens.peek()?,
+        Some(Token::Ident(ref word)) if word.eq_ignore_ascii_case("not")
+    ) {
+        tokens.next()?; // a 'not'
+        negations += 1;
+    }
+    let inner = if matches!(tokens.peek()?, Some(Token::LParen)) {
         if depth >= MAX_GROUP_DEPTH {
             return Err(protocol(format!(
                 "parenthesized groups nest deeper than {MAX_GROUP_DEPTH}"
@@ -419,14 +590,19 @@ fn parse_atom(
         tokens.next()?; // the '('
         let inner = parse_or(tokens, placeholders, depth + 1)?;
         match tokens.next()? {
-            Some(Token::RParen) => Ok(inner),
-            _ => Err(protocol("expected ')' to close the group".to_owned())),
+            Some(Token::RParen) => inner,
+            _ => return Err(protocol("expected ')' to close the group".to_owned())),
         }
     } else if matches!(tokens.peek()?, Some(Token::RParen)) {
-        Err(protocol("empty '(...)' group".to_owned()))
+        return Err(protocol("empty '(...)' group".to_owned()));
     } else {
-        Ok(Node::Pred(parse_predicate(tokens, placeholders)?))
-    }
+        Node::Pred(parse_predicate(tokens, placeholders)?)
+    };
+    Ok(if negations % 2 == 1 {
+        Node::Not(Box::new(inner))
+    } else {
+        inner
+    })
 }
 
 /// One `path op value` or `path in (...)`.
@@ -507,13 +683,9 @@ fn parse_path(tokens: &mut Tokenizer) -> Result<Vec<String>, ConnectionError> {
             Some(Token::Ident(segment)) => segment,
             _ => return Err(protocol("expected a field name".to_owned())),
         };
-        // Unary `not` stays an explicit refusal (v1 rule), never a
-        // reinterpretation of the filter.
-        if segment.eq_ignore_ascii_case("not") {
-            return Err(protocol(
-                "unary 'not' is not supported in filters".to_owned(),
-            ));
-        }
+        // Note: `not` can only reach a dotted path position here
+        // (a segment after a dot); a leading `not` is consumed as the
+        // unary keyword in `parse_atom`, so it is a reserved field.
         if segment.contains('$') {
             return Err(protocol(format!(
                 "path segments may not contain '$': '{segment}'"
@@ -1230,9 +1402,183 @@ mod tests {
         assert!(error("n = 1 and (").contains("expected a field name"));
         assert!(error("n = 1 and (x = 2").contains("expected ')'"));
         assert!(error("n = 1 and ()").contains("empty '(...)' group"));
-        // Unary `not` stays an explicit protocol refusal.
-        assert!(error("not flag = true").contains("'not' is not supported"));
-        assert!(error("n = 1 and not flag = true").contains("'not' is not supported"));
+        // A trailing `not` and a `not` in operator position fail with
+        // the predicate-position messages.
+        assert!(error("n = 1 and not").contains("expected a field name"));
+        assert!(error("n not 1").contains("unsupported operator"));
+    }
+
+    #[test]
+    fn not_negates_field_predicates_in_place() {
+        // A lone negated equality: `$eq` (the shorthand is for field
+        // position only, never inside `$not`).
+        assert_eq!(
+            parse("not n = 1"),
+            vec![(
+                "n".to_owned(),
+                Bson::Document(vec!((
+                    "$not".to_owned(),
+                    Bson::Document(vec![("$eq".to_owned(), Bson::Int32(1))])
+                )))
+            )]
+        );
+        // A negated range keeps its operator doc.
+        assert_eq!(
+            parse("not n > 1"),
+            vec![(
+                "n".to_owned(),
+                Bson::Document(vec![(
+                    "$not".to_owned(),
+                    Bson::Document(vec![("$gt".to_owned(), Bson::Int32(1))])
+                )])
+            )]
+        );
+        // A negated `in` keeps its list inside `$not`.
+        assert_eq!(
+            parse("not n in (1, 2)"),
+            vec![(
+                "n".to_owned(),
+                Bson::Document(vec![(
+                    "$not".to_owned(),
+                    Bson::Document(vec![(
+                        "$in".to_owned(),
+                        Bson::Array(vec![Bson::Int32(1), Bson::Int32(2)])
+                    )])
+                )])
+            )]
+        );
+        // `not` binds tighter than every connector: only `a = 1`
+        // negates here.
+        assert_eq!(
+            parse("not a = 1 or b = 2"),
+            vec![(
+                "$or".to_owned(),
+                Bson::Array(vec![
+                    Bson::Document(vec![(
+                        "a".to_owned(),
+                        Bson::Document(vec![(
+                            "$not".to_owned(),
+                            Bson::Document(vec![("$eq".to_owned(), Bson::Int32(1))])
+                        )])
+                    )]),
+                    Bson::Document(vec![("b".to_owned(), Bson::Int32(2))]),
+                ])
+            )]
+        );
+    }
+
+    #[test]
+    fn not_folds_by_parity_and_negates_groups_by_denior() {
+        // Double negation: identity on the compiled shape.
+        assert_eq!(parse("not not n = 3"), parse("n = 3"));
+        assert_eq!(
+            parse("not not n = 3"),
+            vec![("n".to_owned(), Bson::Int32(3))]
+        );
+        // `not (a or b)` renders mongo's `$nor` over the plain branches.
+        assert_eq!(
+            parse("not (tag = 'a' or flag = false)"),
+            vec![(
+                "$nor".to_owned(),
+                Bson::Array(vec![
+                    Bson::Document(vec![("tag".to_owned(), Bson::String("a".to_owned()))]),
+                    Bson::Document(vec![("flag".to_owned(), Bson::Boolean(false))]),
+                ])
+            )]
+        );
+        // `not (a and b)` = de Morgan: `$or` over the negated conjuncts
+        // (an `and` inside a negation cannot be a single field doc).
+        assert_eq!(
+            parse("not (n > 1 and flag = true)"),
+            vec![(
+                "$or".to_owned(),
+                Bson::Array(vec![
+                    Bson::Document(vec![(
+                        "n".to_owned(),
+                        Bson::Document(vec![(
+                            "$not".to_owned(),
+                            Bson::Document(vec![("$gt".to_owned(), Bson::Int32(1))])
+                        )])
+                    )]),
+                    Bson::Document(vec![(
+                        "flag".to_owned(),
+                        Bson::Document(vec![(
+                            "$not".to_owned(),
+                            Bson::Document(vec![("$eq".to_owned(), Bson::Boolean(true))])
+                        )])
+                    )]),
+                ])
+            )]
+        );
+        // A negated or-group beside plain predicates: the `$nor` doc
+        // chains beside the fields (one group, no `$and` wrapper).
+        assert_eq!(
+            parse("flag = true and not (tag = 'a' or tag = 'b')"),
+            vec![
+                ("flag".to_owned(), Bson::Boolean(true)),
+                (
+                    "$nor".to_owned(),
+                    Bson::Array(vec![
+                        Bson::Document(vec![("tag".to_owned(), Bson::String("a".to_owned()))]),
+                        Bson::Document(vec![("tag".to_owned(), Bson::String("b".to_owned()))]),
+                    ])
+                ),
+            ]
+        );
+        // Triple `not` folds back to one negation.
+        assert_eq!(parse("not not not n = 1"), parse("not n = 1"));
+    }
+
+    #[test]
+    fn negated_predicates_merge_and_conflict_like_positive_ones() {
+        // A `$not` slot merges beside positive operators on the path.
+        assert_eq!(
+            parse("a = 1 and not a = 2"),
+            vec![(
+                "a".to_owned(),
+                Bson::Document(vec![
+                    ("$eq".to_owned(), Bson::Int32(1)),
+                    (
+                        "$not".to_owned(),
+                        Bson::Document(vec![("$eq".to_owned(), Bson::Int32(2))])
+                    ),
+                ])
+            )]
+        );
+        // The mirrored text renders the mirrored (equivalent) shape.
+        assert_eq!(
+            parse("not a = 2 and a = 1"),
+            vec![(
+                "a".to_owned(),
+                Bson::Document(vec![
+                    (
+                        "$not".to_owned(),
+                        Bson::Document(vec![("$eq".to_owned(), Bson::Int32(2))])
+                    ),
+                    ("$eq".to_owned(), Bson::Int32(1)),
+                ])
+            )]
+        );
+        // `a = 1 and not a = 1` is the v1 contradiction, refused.
+        assert!(error("a = 1 and not a = 1").contains("equality contradicts 'not'"));
+        assert!(error("not a = 1 and a = 1").contains("equality contradicts 'not'"));
+        // Two negations on the same path cannot share one operator doc.
+        assert!(error("not a > 1 and not a < 5").contains("repeated $not"));
+        // A negation beside `in` refuses the shared path (v1 rule).
+        assert!(error("a in (1, 2) and not a = 3").contains("cannot share path"));
+        assert!(error("not a = 3 and a in (1, 2)").contains("conflicting 'in'"));
+        // The contradiction check binds VALUES, so params work.
+        let filter = parse_filter("a = ? and not a = ?");
+        assert!(filter.is_ok());
+        let conflict = parse_filter("a = ? and not a = ?")
+            .expect("parses")
+            .document(&[QueryParameter::Integer(7), QueryParameter::Integer(7)]);
+        assert!(matches!(
+            conflict,
+            Err(ConnectionError::Protocol(ref message)) if message.contains("contradicts")
+        ));
+        // Same path in different or-branches stays independent.
+        let _ = parse("not a = 1 or not a = 2");
     }
 
     const MANY_PARENS: &str = "((((((((((((((((n = 1))))))))))))))))";

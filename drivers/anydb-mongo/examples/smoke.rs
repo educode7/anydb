@@ -83,6 +83,30 @@ async fn main() {
         "find anydb_smoke with (n in (1, 3) or tag = 'dec')",
     );
 
+    // 2c) Unary `not`: group negation as `$nor`, a negated `in` as
+    // `{n: {$not: {$in: [...]}}}`, and a `$not` slot merged beside a
+    // positive equality. All applied server-side by the real mongod.
+    let negated = source
+        .execute_statement_typed("find anydb_smoke with not (n > 5 or tag = 'a')", &[])
+        .await
+        .expect("not group find");
+    print_result(&negated, "find anydb_smoke with not (n > 5 or tag = 'a')");
+
+    let negated_in = source
+        .execute_statement_typed("find anydb_smoke with not n in (1, 2, 3, 4)", &[])
+        .await
+        .expect("not in find");
+    print_result(&negated_in, "find anydb_smoke with not n in (1, 2, 3, 4)");
+
+    let negated_slot = source
+        .execute_statement_typed("find anydb_smoke with flag = true and not tag = 'a'", &[])
+        .await
+        .expect("not slot find");
+    print_result(
+        &negated_slot,
+        "find anydb_smoke with flag = true and not tag = 'a'",
+    );
+
     // 3) Cursor paging: batches of two while the cursor id stays open.
     let mut page = source
         .query_page_start(
