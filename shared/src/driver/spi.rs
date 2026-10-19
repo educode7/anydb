@@ -89,6 +89,21 @@ pub trait DataSource: Send + Sync {
         self.execute_statement_typed(sql, params).await
     }
 
+    /// Starts an explicit transaction over the live context (JDBC
+    /// `setAutoCommit(false)` analog: DBeaver drives `BEGIN`-shaped
+    /// control through the session before grouped statements). Default:
+    /// the driver does not carry transaction semantics, surfacing
+    /// `ConnectionError::DriverFailure`.
+    async fn begin_transaction(&self) -> Result<(), ConnectionError> {
+        Err(ConnectionError::DriverFailure)
+    }
+
+    /// Commits the live transaction after a grouped run. Default: no
+    /// transaction semantics, surfacing `ConnectionError::DriverFailure`.
+    async fn commit_transaction(&self) -> Result<(), ConnectionError> {
+        Err(ConnectionError::DriverFailure)
+    }
+
     /// Rolls back the live transaction after an abort (DBeaver invalidates
     /// transactions by running a rollback). Default: the driver does not
     /// carry transaction semantics, surfacing

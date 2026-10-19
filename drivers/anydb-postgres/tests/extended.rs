@@ -590,3 +590,53 @@ async fn execute_statement_goes_through_the_spi() {
     source.close().await;
     server.await.expect("server task");
 }
+
+/// SPI transaction control: `BEGIN` (Ready `T`) then `COMMIT` (Ready `I`)
+/// over the `DataSource` trait methods (DBeaver session txn control).
+async fn spi_transaction_cycle_server(mut stream: TcpStream) {
+    assert_eq!(
+        read_startup(&mut stream).await,
+        anydb_postgres::protocol::PROTOCOL_VERSION_3
+    );
+    authentication_ok(&mut stream).await;
+    ready_for_query(&mut stream).await;
+
+    for (control, tag) in [("BEGIN", b"T".as_slice()), ("COMMIT", b"I")] {
+        assert_parse(&mut stream, control, &[]).await;
+        assert_bind(&mut stream, &[]).await;
+        assert_describe_portal(&mut stream).await;
+        assert_execute_unlimited(&mut stream).await;
+        assert_sync(&mut stream).await;
+        send(&mut stream, b'1', &[]).await;
+        send(&mut stream, b'2', &[]).await;
+        send(&mut stream, b't', &parameter_description(&[])).await;
+        send(&mut stream, b'n', &[]).await;
+        send(&mut stream, b'C', format!("{control}\0").as_bytes()).await;
+        if tag == b"T" {
+            ready_for_query_in_txn(&mut stream).await;
+        } else {
+            ready_for_query(&mut stream).await;
+        }
+    }
+
+    let (terminate, _) = read_message(&mut stream).await;
+    assert_eq!(terminate, b'X', "close must send Terminate");
+}
+
+#[tokio::test]
+async fn spi_exposes_begin_and_commit_transaction_control() {
+    let (address, server) = spawn_backend(spi_transaction_cycle_server).await;
+    let driver = PostgresDriver::new();
+    let request = OpenRequest {
+        container_id: "c1".into(),
+        target: format!("postgres://user@{}/db", address),
+        properties: Default::default(),
+    };
+    let source = driver.open_data_source(request).await.expect("open");
+
+    source.begin_transaction().await.expect("BEGIN over SPI");
+    source.commit_transaction().await.expect("COMMIT over SPI");
+
+    source.close().await;
+    server.await.expect("server task");
+}

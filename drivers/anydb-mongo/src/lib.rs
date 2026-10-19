@@ -27,6 +27,10 @@
 //! `insert <n>` with the server's count and no result columns or rows.
 //! An insert binds nothing, so it takes no parameters, and it never
 //! pages — cursor paging answers `Protocol` for it.
+//!
+//! Multi-document ACID transactions require a replica-set session and
+//! are not wired: the `DataSource` transaction-control SPI methods use
+//! the trait's refusing defaults.
 //! The typed mapping converts every BSON value through the shared
 //! `TypedValue` contract, with extended-JSON rendering for embedded
 //! documents and ISO-8601 text for UTC datetimes.
