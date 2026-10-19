@@ -212,6 +212,18 @@ pub fn parse_document(input: &[u8]) -> Result<Document, ConnectionError> {
     reader.document_body()
 }
 
+/// Parses one BSON document, reporting the bytes it consumed (a
+/// self-delimiting prefix of the input) — OP_MSG section walking needs
+/// the exact boundary to prove nothing trails the section.
+pub fn parse_document_len(input: &[u8]) -> Result<(Document, usize), ConnectionError> {
+    let mut reader = Reader {
+        bytes: input,
+        position: 0,
+    };
+    let document = reader.document_body()?;
+    Ok((document, reader.position))
+}
+
 /// Parses a stream of concatenated BSON documents (raw reply bodies).
 pub fn parse_documents(input: &[u8]) -> Result<Vec<Document>, ConnectionError> {
     let mut reader = Reader {

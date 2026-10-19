@@ -27,19 +27,24 @@ async fn read_frame<S: AsyncRead + Unpin>(stream: &mut S) -> Option<(i32, Docume
     stream.read_exact(&mut body).await.ok()?;
     Some((
         request_id,
-        anydb_mongo::bson::parse_document(&body[4..]).ok()?,
+        if body.get(4) == Some(&0x00) {
+            anydb_mongo::bson::parse_document(&body[5..]).ok()?
+        } else {
+            return None;
+        },
     ))
 }
 
 async fn write_frame<S: AsyncWrite + Unpin>(stream: &mut S, response_to: i32, body: &Document) {
     let document = anydb_mongo::bson::encode_document(body).expect("reply encodes");
-    let length = (20 + document.len()) as i32;
+    let length = (21 + document.len()) as i32;
     let mut out = Vec::with_capacity(length as usize);
     out.extend_from_slice(&length.to_le_bytes());
     out.extend_from_slice(&2i32.to_le_bytes());
     out.extend_from_slice(&response_to.to_le_bytes());
     out.extend_from_slice(&2013i32.to_le_bytes());
     out.extend_from_slice(&0i32.to_le_bytes());
+    out.push(0x00);
     out.extend_from_slice(&document);
     stream.write_all(&out).await.expect("reply write");
     stream.flush().await.expect("reply flush");

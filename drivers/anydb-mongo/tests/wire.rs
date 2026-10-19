@@ -171,18 +171,23 @@ async fn read_frame(stream: &mut OwnedReadHalf) -> Option<(i32, Document)> {
     let request_id = i32::from_le_bytes(header[4..8].try_into().expect("4 bytes"));
     let mut body = vec![0u8; (length - 16) as usize];
     stream.read_exact(&mut body).await.ok()?;
-    Some((request_id, bson::parse_document(&body[4..]).ok()?))
+    // Section framing per OP_MSG: flags word + one kind byte + document.
+    if body.get(4) != Some(&0x00) {
+        return None;
+    }
+    Some((request_id, bson::parse_document(&body[5..]).ok()?))
 }
 
 async fn write_frame(stream: &mut OwnedWriteHalf, response_to: i32, body: &Document) {
     let document = bson::encode_document(body).expect("reply encodes");
-    let length = (20 + document.len()) as i32;
+    let length = (21 + document.len()) as i32;
     let mut out = Vec::with_capacity(length as usize);
     out.extend_from_slice(&length.to_le_bytes());
     out.extend_from_slice(&2i32.to_le_bytes());
     out.extend_from_slice(&response_to.to_le_bytes());
     out.extend_from_slice(&2013i32.to_le_bytes());
     out.extend_from_slice(&0i32.to_le_bytes());
+    out.push(0x00);
     out.extend_from_slice(&document);
     stream.write_all(&out).await.expect("reply write");
 }

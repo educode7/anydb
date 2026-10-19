@@ -1,9 +1,10 @@
 //! OP_MSG framing (server protocol since 3.6): one 16-byte header with
-//! the four little-endian `i32` fields, a flags word and the message
-//! body as exactly one BSON document. Outgoing bodies are always a
-//! single type-0 section; incoming bodies are restricted the same way
-//! (extra sections, checksummed or `moreToCome` messages are explicit
-//! `Protocol` errors instead of silent skips).
+//! the four little-endian `i32` fields, a flags word, and the message
+//! body as sections — outgoing always one type-0 section (kind byte
+//! `0x00` followed by one BSON document); incoming bodies are restricted
+//! the same way (different section kinds, document sequences, checksummed
+//! or `moreToCome` messages are explicit `Protocol` errors instead of
+//! silent skips).
 
 use tokio::io::{AsyncRead, AsyncReadExt};
 
@@ -16,6 +17,9 @@ const HEADER_SIZE: usize = 16;
 /// The server spec's 48 MiB message cap; replies over it are protocol
 /// violations we refuse to buffer.
 const MAX_MESSAGE_SIZE: usize = 48 * 1024 * 1024;
+
+/// The type-0 section kind byte: `flags` word + `[0x00][BSON document]`.
+const TYPE_0_SECTION: u8 = 0x00;
 
 fn protocol(message: String) -> ConnectionError {
     ConnectionError::Protocol(format!("OP_MSG: {message}"))
@@ -74,7 +78,18 @@ impl OpMsg {
                 "flags {flags:#010x} are not supported (checksums/moreToCome rejected)"
             )));
         }
-        let document = bson::parse_document(&body[4..])?;
+        if body[4] != TYPE_0_SECTION {
+            return Err(protocol(format!(
+                "section kind {} is not supported (single type-0 section only)",
+                body[4]
+            )));
+        }
+        let (document, consumed) = bson::parse_document_len(&body[5..])?;
+        if consumed != body.len() - 5 {
+            return Err(protocol(
+                "trailing sections after the body document are not supported".to_owned(),
+            ));
+        }
         Ok(Self {
             request_id,
             response_to,
@@ -87,7 +102,8 @@ impl OpMsg {
     /// the connection uses `response_to` ordering.
     pub fn encode(request_id: i32, body: &Document) -> Result<Vec<u8>, ConnectionError> {
         let document = bson::encode_document(body)?;
-        let length = (HEADER_SIZE + 4)
+        // flags (u32) + section-kind byte + the document.
+        let length = (HEADER_SIZE + 4 + 1)
             .checked_add(document.len())
             .ok_or_else(|| protocol("message too large".to_owned()))?;
         if length > MAX_MESSAGE_SIZE {
@@ -101,6 +117,7 @@ impl OpMsg {
         out.extend_from_slice(&0i32.to_le_bytes());
         out.extend_from_slice(&OP_MSG_OPCODE.to_le_bytes());
         out.extend_from_slice(&0i32.to_le_bytes());
+        out.push(TYPE_0_SECTION);
         out.extend_from_slice(&document);
         Ok(out)
     }
@@ -126,8 +143,38 @@ mod tests {
         assert_eq!(&frame[8..12], &0i32.to_le_bytes());
         assert_eq!(&frame[12..16], &OP_MSG_OPCODE.to_le_bytes());
         assert_eq!(&frame[16..20], &0i32.to_le_bytes(), "flags word is zero");
-        let parsed = bson::parse_document(&frame[20..]).expect("body parses");
+        assert_eq!(&frame[20], &TYPE_0_SECTION, "type-0 section kind byte");
+        let parsed = bson::parse_document(&frame[21..]).expect("body parses");
         assert_eq!(parsed, document(1));
+        assert_eq!(
+            bson::parse_document_len(&frame[21..]).expect("parses").1,
+            frame.len() - 21,
+            "the document consumes the whole section"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_round_trips_the_single_type_0_section() {
+        let frame = OpMsg::encode(9, &document(2)).expect("encode");
+        let message = OpMsg::read(&mut std::io::Cursor::new(frame))
+            .await
+            .expect("read");
+        assert_eq!(message.request_id, 9);
+        assert_eq!(message.body, document(2));
+    }
+
+    #[tokio::test]
+    async fn non_zero_section_kinds_are_rejected() {
+        let mut frame = OpMsg::encode(9, &document(2)).expect("encode");
+        // Corrupt the section kind byte (body = flags + kind + document).
+        frame[20] = 0x01;
+        let error = OpMsg::read(&mut std::io::Cursor::new(frame))
+            .await
+            .expect_err("rejected");
+        assert!(
+            matches!(error, ConnectionError::Protocol(ref message) if message.contains("section kind")),
+            "unexpected error: {error:?}"
+        );
     }
 
     #[test]

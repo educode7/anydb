@@ -124,6 +124,10 @@ pub struct Connection {
     stream: NetStream,
     next_request_id: i32,
     server_version: String,
+
+    /// Database every OP_MSG request carries as `$db` (the URL path).
+    auth_db: String,
+
     /// The one suspended cursor (`getMore` paging); `None` when no
     /// paging flow is half-open. One cursor at a time keeps the state
     /// machine as simple as the postgres portal does.
@@ -159,6 +163,7 @@ impl Connection {
             next_request_id: 1,
             server_version: "unknown".to_owned(),
             open_cursor: None,
+            auth_db: target.auth_db.clone(),
         };
 
         let mut handshake = Document::from(vec![
@@ -176,7 +181,19 @@ impl Connection {
                             ),
                         ])),
                     ),
-                    ("os".to_owned(), Bson::Document(Document::new())),
+                    // mongod validates the metadata shape (code 183):
+                    // `os.type` is mandatory; name/architecture fill the
+                    // rest of the documented contract.
+                    (
+                        "os".to_owned(),
+                        Bson::Document(Document::from(vec![
+                            ("type".to_owned(), Bson::String(os_type())),
+                            (
+                                "architecture".to_owned(),
+                                Bson::String(std::env::consts::ARCH.to_owned()),
+                            ),
+                        ])),
+                    ),
                     (
                         "platform".to_owned(),
                         Bson::String(env!("CARGO_PKG_VERSION").to_owned()),
@@ -192,6 +209,19 @@ impl Connection {
         }
         let reply = connection.command(&handshake).await?;
         if let Some((_, Bson::String(version))) = reply.iter().find(|(key, _)| key == "version") {
+            connection.server_version = version.clone();
+        }
+        // Modern `hello` replies carry no `version` field: one fallback
+        // `buildInfo` round-trip resolves it.
+        if connection.server_version == "unknown"
+            && let Ok(info) = connection
+                .command(&Document::from(vec![(
+                    "buildInfo".to_owned(),
+                    Bson::Int32(1),
+                )]))
+                .await
+            && let Some((_, Bson::String(version))) = info.iter().find(|(key, _)| key == "version")
+        {
             connection.server_version = version.clone();
         }
 
@@ -211,14 +241,17 @@ impl Connection {
     pub fn server_version(&self) -> &str {
         &self.server_version
     }
-
     /// One round-trip command: encode OP_MSG, read the reply, require
     /// `ok: 1`, map mongo error payloads onto the shared error type
-    /// (code 18 = AuthenticationFailed -> `AuthFailed`).
+    /// (code 18 = AuthenticationFailed -> `AuthFailed`). Every OP_MSG
+    /// request carries the `$db` argument (code 40571 otherwise): the
+    /// URL-path database, which is also the SCRAM `authSource` default.
     async fn command(&mut self, body: &Document) -> Result<Document, ConnectionError> {
+        let mut wire_body = body.clone();
+        wire_body.push(("$db".to_owned(), Bson::String(self.auth_db.clone())));
         let request_id = self.next_request_id;
         self.next_request_id += 1;
-        let frame = OpMsg::encode(request_id, body)?;
+        let frame = OpMsg::encode(request_id, &wire_body)?;
         self.stream
             .write_all(&frame)
             .await
@@ -664,6 +697,17 @@ fn reply_payload(reply: &Document) -> Result<Vec<u8>, ConnectionError> {
         Some((_, Bson::Binary(bytes))) => Ok(bytes.clone()),
         Some((_, other)) => Err(protocol(format!("SCRAM payload is not binary: {other:?}"))),
         None => Err(protocol("SCRAM reply lacks a payload".to_owned())),
+    }
+}
+
+/// mongod-recognized `os.type` per the driver metadata spec: `windows`,
+/// `macos`, `linux`; other platforms pass their raw OID name.
+fn os_type() -> String {
+    match std::env::consts::OS {
+        "macos" => "macos".to_owned(),
+        "linux" => "linux".to_owned(),
+        "windows" => "windows".to_owned(),
+        other => other.to_owned(),
     }
 }
 
