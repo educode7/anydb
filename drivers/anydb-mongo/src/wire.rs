@@ -119,6 +119,27 @@ fn int32_field(document: &Document, key: &str) -> i32 {
     }
 }
 
+/// Inserted count of an `insert` reply (`n`): a server counter arrives
+/// as Int32 or Int64 (Double tolerated for robustness). A reply without
+/// a count is a protocol error, never a silently successful zero.
+fn count_field(document: &Document, key: &str) -> Result<i64, ConnectionError> {
+    let found = document
+        .iter()
+        .find(|(field_key, _)| field_key == key)
+        .map(|(_, value)| value);
+    match found {
+        Some(Bson::Int32(value)) => Ok(i64::from(*value)),
+        Some(Bson::Int64(value)) => Ok(*value),
+        Some(Bson::Double(value)) => Ok(*value as i64),
+        Some(_) => Err(protocol(format!(
+            "'{key}' in the insert reply is not a count"
+        ))),
+        None => Err(protocol(format!(
+            "the insert reply carries no '{key}' count"
+        ))),
+    }
+}
+
 #[derive(Debug)]
 pub struct Connection {
     stream: NetStream,
@@ -492,6 +513,44 @@ impl Connection {
             return Err(error);
         }
         Ok(())
+    }
+
+    /// `insert` command: one document per statement, one round-trip.
+    /// Returns the server's inserted count (`n`). Write errors arrive
+    /// with `ok: 1` (mongo's ordered-write reply shape), so they are
+    /// read out of the reply explicitly and surfaced as failures — a
+    /// rejected insert never reads as a successful one.
+    pub async fn insert(
+        &mut self,
+        collection: &str,
+        document: &Document,
+    ) -> Result<i64, ConnectionError> {
+        let command = Document::from(vec![
+            ("insert".to_owned(), Bson::String(collection.to_owned())),
+            (
+                "documents".to_owned(),
+                Bson::Array(vec![Bson::Document(document.clone())]),
+            ),
+        ]);
+        let reply = self.command(&command).await?;
+        match reply.iter().find(|(key, _)| key == "writeErrors") {
+            None => {}
+            Some((_, Bson::Array(errors))) => match errors.first() {
+                None => {}
+                Some(Bson::Document(error)) => return Err(command_error(error)),
+                Some(_) => {
+                    return Err(protocol(
+                        "malformed writeErrors payload in the insert reply".to_owned(),
+                    ));
+                }
+            },
+            Some(_) => {
+                return Err(protocol(
+                    "malformed writeErrors payload in the insert reply".to_owned(),
+                ));
+            }
+        }
+        count_field(&reply, "n")
     }
 
     /// Keepalive command (`{ping: 1}`), the whole driver surface the

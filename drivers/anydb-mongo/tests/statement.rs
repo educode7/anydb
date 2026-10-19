@@ -1,8 +1,16 @@
-//! The `find <collection> with <filter-text>` statement surface: filter
-//! text compiles to a BSON document client-side with `?` parameters
+//! The mongo statement surface: `find <collection> with <filter-text>`
+//! and `insert <collection> with <json-document>`.
+//!
+//! Filters compile to a BSON document client-side with `?` parameters
 //! bound to typed values. The fake mongod asserts the exact filter
 //! document it received and applies a tiny matcher to its dataset, so
 //! the tests prove the filter travels, binds, and actually filters.
+//!
+//! The insert half proves the parsed JSON document reaches the wire as
+//! the command's only element, that a server write error stays an
+//! error, and that every insert failure is client-side (the
+//! handshake-only server panics on any command, so a Protocol verdict
+//! there proves no frame was ever written).
 
 use std::future::Future;
 
@@ -826,4 +834,205 @@ async fn decimal_params_filter_exact_decimal_values() {
     }
 
     server.await.expect("server task");
+}
+
+// ---------- insert statement surface ---------------------------------
+
+/// A field lookup with wording that fits any command (the find-side
+/// helper's panic message names `find`).
+fn field<'a>(command: &'a Document, key: &str) -> &'a Bson {
+    command
+        .iter()
+        .find(|(name, _)| name == key)
+        .map(|(_, value)| value)
+        .unwrap_or_else(|| panic!("the command carries {key}"))
+}
+
+fn insert_reply(inserted: i32) -> Document {
+    Document::from(vec![
+        ("ok".to_owned(), int32(1)),
+        ("n".to_owned(), int32(inserted)),
+    ])
+}
+
+/// Handshake + exactly one `insert` command: asserts the full wire
+/// shape (command name, target collection, `$db`, and the documents
+/// array carrying the parsed document verbatim), then replies.
+async fn insert_server(stream: TcpStream, expected: Document, reply: Document) {
+    let mut stream = stream;
+    handshake(&mut stream).await;
+    let Some((request_id, command)) = read_frame(&mut stream).await else {
+        panic!("insert command read");
+    };
+    assert_eq!(first_command(&command), "insert");
+    assert_eq!(
+        field(&command, "insert"),
+        &Bson::String("components".to_owned()),
+        "the command targets the statement's collection"
+    );
+    assert_eq!(
+        field(&command, "documents"),
+        &Bson::Array(vec![Bson::Document(expected)]),
+        "documents carries the parsed JSON document as its only element"
+    );
+    assert_eq!(
+        field(&command, "$db"),
+        &Bson::String("admin".to_owned()),
+        "every OP_MSG request carries the $db argument"
+    );
+    write_frame(&mut stream, request_id, &reply).await;
+}
+
+#[tokio::test]
+async fn insert_statement_ships_the_parsed_document() {
+    let expected: Document = vec![
+        ("codeGroup".to_owned(), Bson::String("1".to_owned())),
+        ("isActive".to_owned(), Bson::String("1".to_owned())),
+        (
+            "listComponent".to_owned(),
+            Bson::Array(vec![Bson::Document(vec![(
+                "codeComponent".to_owned(),
+                Bson::String("1".to_owned()),
+            )])]),
+        ),
+        ("hasModal".to_owned(), Bson::Boolean(true)),
+        (
+            "modalOptions".to_owned(),
+            Bson::Array(vec![Bson::Document(vec![
+                (
+                    "title".to_owned(),
+                    Bson::String("Mercancías Restringidas".to_owned()),
+                ),
+                (
+                    "authenticationType".to_owned(),
+                    Bson::String("AUTH1_AUTH2".to_owned()),
+                ),
+            ])]),
+        ),
+    ];
+    let (port, server) =
+        spawn_server(move |stream| insert_server(stream, expected, insert_reply(1)));
+    let source = source_for(port).await;
+
+    let typed = source
+        .execute_statement_typed(
+            r#"insert components with {"codeGroup":"1","isActive":"1","listComponent":[{"codeComponent":"1"}],"hasModal":true,"modalOptions":[{"title":"Mercancías Restringidas","authenticationType":"AUTH1_AUTH2"}]}"#,
+            &[],
+        )
+        .await
+        .expect("insert executes");
+    assert!(
+        typed.columns.is_empty(),
+        "an insert yields no result columns, got {:?}",
+        typed.columns
+    );
+    assert!(
+        typed.rows.is_empty(),
+        "an insert yields no result rows, got {:?}",
+        typed.rows
+    );
+    assert_eq!(typed.command_tag, Some("insert 1".to_owned()));
+    assert_eq!(typed.affected_rows, Some(1));
+
+    server.await.expect("server task");
+}
+
+#[tokio::test]
+async fn insert_write_errors_stay_errors() {
+    let write_error: Document = vec![
+        ("index".to_owned(), int32(0)),
+        ("code".to_owned(), int32(11000)),
+        (
+            "errmsg".to_owned(),
+            Bson::String(
+                "E11000 duplicate key error collection: vuce-landing.components index: _id_"
+                    .to_owned(),
+            ),
+        ),
+    ];
+    let reply = Document::from(vec![
+        ("ok".to_owned(), int32(1)),
+        ("n".to_owned(), int32(0)),
+        (
+            "writeErrors".to_owned(),
+            Bson::Array(vec![Bson::Document(write_error)]),
+        ),
+    ]);
+    let (port, server) =
+        spawn_server(move |stream| insert_server(stream, vec![("a".to_owned(), int32(1))], reply));
+    let source = source_for(port).await;
+
+    let error = source
+        .execute_statement_typed(r#"insert components with {"a":1}"#, &[])
+        .await
+        .expect_err("a write error must not read as a successful insert");
+    assert!(
+        matches!(
+            &error,
+            ConnectionError::ExecutionFailed { message, .. } if message.contains("E11000")
+        ),
+        "the server's write errmsg surfaces, got {error:?}"
+    );
+
+    server.await.expect("server task");
+}
+
+#[tokio::test]
+async fn insert_failures_never_reach_the_wire() {
+    let (port, server) = spawn_server(handshake_only_server);
+    let source = source_for(port).await;
+
+    // Parameters: the document IS the payload, there is nothing to bind.
+    let error = source
+        .execute_statement_typed(r#"insert c1 with {"a":1}"#, &[QueryParameter::Integer(1)])
+        .await
+        .expect_err("parameters refused");
+    assert!(
+        protocol_error(error, "insert statements take no parameters"),
+        "a parameterized insert is a client-side protocol error"
+    );
+
+    // Syntax: malformed JSON, a non-object top level, a missing
+    // collection — all resolved before any frame exists.
+    let error = source
+        .execute_statement_typed("insert components with {not json}", &[])
+        .await
+        .expect_err("malformed document");
+    assert!(protocol_error(error, "mongo insert document"));
+
+    let error = source
+        .execute_statement_typed(r#"insert components with [{"a":1}]"#, &[])
+        .await
+        .expect_err("a top-level array is not a document");
+    assert!(protocol_error(error, "expected a JSON object"));
+
+    let error = source
+        .execute_statement_typed("insert", &[])
+        .await
+        .expect_err("missing collection");
+    assert!(protocol_error(
+        error,
+        "mongo statements are 'find <collection> [with <filter>]' or 'insert <collection> with <document>'"
+    ));
+
+    // The handshake-only server answers `ok: 0` to any command it does
+    // receive, so a Protocol verdict above proves nothing was sent.
+    drop(server);
+}
+
+#[tokio::test]
+async fn paging_rejects_insert_statements() {
+    let (port, server) = spawn_server(handshake_only_server);
+    let source = source_for(port).await;
+
+    let error = source
+        .query_page_start(r#"insert c1 with {"a":1}"#, &[], 10)
+        .await
+        .expect_err("an insert has no cursor to page");
+    assert!(
+        protocol_error(error, "cursor paging requires a find statement"),
+        "paging must reject the statement client-side, got nothing"
+    );
+
+    drop(server);
 }

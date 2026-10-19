@@ -19,6 +19,14 @@
 //! client-side WITH typed parameter values — mongo has no wire binding,
 //! so `?` placeholders interpolate nothing: see `filter`. Errors around
 //! arity and syntax are `Protocol`, raised before any wire round-trip.
+//!
+//! The write half of the surface is
+//! `"insert <collection> with <json-document>"`: the JSON object after
+//! `with` parses into its BSON document client-side and travels as the
+//! `documents` array of an `insert` command (see `document`), reporting
+//! `insert <n>` with the server's count and no result columns or rows.
+//! An insert binds nothing, so it takes no parameters, and it never
+//! pages — cursor paging answers `Protocol` for it.
 //! The typed mapping converts every BSON value through the shared
 //! `TypedValue` contract, with extended-JSON rendering for embedded
 //! documents and ISO-8601 text for UTC datetimes.
@@ -29,6 +37,7 @@ use async_trait::async_trait;
 use tokio::sync::Mutex as AsyncMutex;
 
 pub mod bson;
+mod document;
 mod filter;
 mod op_msg;
 mod scram;
@@ -158,14 +167,32 @@ fn host_port_target(
     })
 }
 
-/// The supported statement form: `find <collection> [with <filter-text>]`.
-/// The filter text keeps its original spacing — string literals inside it
-/// may contain any whitespace, so parsing slices the raw SQL instead of
-/// re-joining whitespace-split tokens.
+/// The supported statement forms: `find <collection> [with <filter-text>]`
+/// and `insert <collection> with <json-document>`. The trailing text
+/// keeps its original spacing — string literals inside it may contain
+/// any whitespace, so parsing slices the raw SQL instead of re-joining
+/// whitespace-split tokens.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FindStatement {
     pub collection: String,
     filter: Option<filter::Filter>,
+}
+
+/// `insert <collection> with <json-document>`: the JSON object IS the
+/// payload (mongo binds nothing for it), parsed into its BSON document
+/// while the statement text is still client-side.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InsertStatement {
+    pub collection: String,
+    document: bson::Document,
+}
+
+/// Both statement forms a mongo connection accepts. `find` pages
+/// (fetch-all or a suspended cursor); `insert` never pages.
+#[derive(Debug)]
+pub enum Statement {
+    Find(FindStatement),
+    Insert(InsertStatement),
 }
 
 impl FindStatement {
@@ -187,60 +214,82 @@ impl FindStatement {
     }
 }
 
-/// Parses `find <collection> [with <filter-text>]` by slicing the raw
-/// SQL: the command word and collection are single tokens, everything
-/// after a standalone `with` is the verbatim filter text.
-fn parse_statement(sql: &str) -> Result<FindStatement, ConnectionError> {
-    fn protocol(message: String) -> ConnectionError {
-        ConnectionError::Protocol(format!("unsupported statement: {message}"))
+/// Statement-shape protocol error: nothing was sent, the statement
+/// itself is not one mongo understands.
+fn statement_protocol(message: String) -> ConnectionError {
+    ConnectionError::Protocol(format!("unsupported statement: {message}"))
+}
+
+/// Parses `find <collection> [with <filter-text>]` and
+/// `insert <collection> with <json-document>` by slicing the raw SQL:
+/// the command word and collection are single tokens, everything after
+/// a standalone `with` is the verbatim filter text or the verbatim
+/// document text. Both forms resolve completely client-side.
+fn parse_statement(sql: &str) -> Result<Statement, ConnectionError> {
+    fn unsupported() -> ConnectionError {
+        statement_protocol(
+            "mongo statements are 'find <collection> [with <filter>]' or 'insert <collection> with <document>'"
+                .to_owned(),
+        )
     }
     // Leading whitespace only separates tokens; the collection and
-    // filter boundaries below still need single whitespace splits.
+    // clause boundaries below still need single whitespace splits.
     let sql = sql.trim_start();
     let Some((command, tail)) = sql.split_once(char::is_whitespace) else {
-        return Err(protocol(
-            "mongo statements are 'find <collection> [with <filter>]'".to_owned(),
-        ));
+        return Err(unsupported());
     };
-    if command != "find" {
-        return Err(protocol(
-            "mongo statements are 'find <collection> [with <filter>]'".to_owned(),
-        ));
+    if command != "find" && command != "insert" {
+        return Err(unsupported());
     }
     let (collection, remainder) = match tail.trim_start().split_once(char::is_whitespace) {
         Some((collection, remainder)) => (collection, remainder.trim_start()),
         None => (tail.trim_start(), ""),
     };
     if collection.is_empty() {
-        return Err(protocol(
-            "mongo statements are 'find <collection> [with <filter>]'".to_owned(),
-        ));
+        return Err(unsupported());
     }
     if collection.starts_with('$') {
-        return Err(protocol(
+        return Err(statement_protocol(
             "collection names may not start with '$'".to_owned(),
         ));
     }
-    let filter = match remainder {
-        "" => None,
-        _ => {
-            let mut parts = remainder.splitn(2, char::is_whitespace);
-            if parts.next() != Some("with") {
-                return Err(protocol(format!(
-                    "unexpected tokens after the collection: '{remainder}'"
-                )));
+    let mut parts = remainder.splitn(2, char::is_whitespace);
+    let clause = parts.next().unwrap_or_default();
+    if !remainder.is_empty() && clause != "with" {
+        return Err(statement_protocol(format!(
+            "unexpected tokens after the collection: '{remainder}'"
+        )));
+    }
+    match command {
+        "insert" => {
+            if remainder.is_empty() {
+                return Err(statement_protocol(
+                    "insert statements are 'insert <collection> with <document>'".to_owned(),
+                ));
             }
-            // 'find c with' with nothing after dies in the empty-filter
-            // protocol error of the filter parser.
-            Some(filter::parse_filter(
-                parts.next().unwrap_or_default().trim_start(),
-            )?)
+            let text = parts.next().unwrap_or_default().trim_start();
+            let document = document::parse_document_literal(text)?;
+            Ok(Statement::Insert(InsertStatement {
+                collection: collection.to_owned(),
+                document,
+            }))
         }
-    };
-    Ok(FindStatement {
-        collection: collection.to_owned(),
-        filter,
-    })
+        _ => {
+            let filter = if remainder.is_empty() {
+                None
+            } else {
+                // 'find c with' with nothing after dies in the empty-filter
+                // protocol error of the filter parser.
+                Some(filter::parse_filter(
+                    parts.next().unwrap_or_default().trim_start(),
+                )?)
+            };
+            Ok(Statement::Find(FindStatement {
+                collection: collection.to_owned(),
+                filter,
+            }))
+        }
+    }
 }
 
 /// Live data source over exactly one wire connection; commands serialize
@@ -290,6 +339,37 @@ impl WireDataSource {
         ))
     }
 
+    /// Typed insert core: the document was parsed and validated while
+    /// the statement text was still client-side, so the only check left
+    /// is arity — mongo binds nothing for a document, therefore any
+    /// parameter is a protocol error raised BEFORE the connection is
+    /// locked. The result reports no columns and no rows, only the
+    /// server's `insert <n>` tag and count.
+    async fn insert_typed(
+        &self,
+        statement: &InsertStatement,
+        params: &[QueryParameter],
+    ) -> Result<TypedStatementResult, ConnectionError> {
+        if !params.is_empty() {
+            return Err(ConnectionError::Protocol(
+                "insert statements take no parameters".to_owned(),
+            ));
+        }
+        let mut guard = self.connection.lock().await;
+        let Some(connection) = guard.as_mut() else {
+            return Err(ConnectionError::DriverFailure);
+        };
+        let inserted = connection
+            .insert(&statement.collection, &statement.document)
+            .await?;
+        Ok(TypedStatementResult {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            command_tag: Some(format!("insert {inserted}")),
+            affected_rows: Some(inserted),
+        })
+    }
+
     /// Typed driver surface of cursor paging (postgres `TypedPage`
     /// shape). Takes the VERBATIM statement (like the postgres
     /// `query_page_start(sql, params, limit)`): `limit = 0` degenerates
@@ -303,7 +383,14 @@ impl WireDataSource {
         params: &[QueryParameter],
         limit: i32,
     ) -> Result<WirePage, ConnectionError> {
-        let statement = parse_statement(sql)?;
+        let statement = match parse_statement(sql)? {
+            Statement::Find(statement) => statement,
+            Statement::Insert(_) => {
+                return Err(ConnectionError::Protocol(
+                    "cursor paging requires a find statement".to_owned(),
+                ));
+            }
+        };
         let filter = statement.filter_document(params)?;
         let mut guard = self.connection.lock().await;
         let Some(connection) = guard.as_mut() else {
@@ -367,14 +454,18 @@ impl DataSource for WireDataSource {
     }
 
     /// Typed execution: `find <collection> [with <filter>]` with `?`
-    /// parameters bound to typed BSON values client-side.
+    /// parameters bound to typed BSON values client-side, or
+    /// `insert <collection> with <json-document>` whose JSON document
+    /// IS the payload (an insert takes no parameters).
     async fn execute_statement_typed(
         &self,
         sql: &str,
         params: &[QueryParameter],
     ) -> Result<TypedStatementResult, ConnectionError> {
-        let statement = parse_statement(sql)?;
-        self.find_typed(&statement, params).await
+        match parse_statement(sql)? {
+            Statement::Find(statement) => self.find_typed(&statement, params).await,
+            Statement::Insert(statement) => self.insert_typed(&statement, params).await,
+        }
     }
 
     async fn close(&self) {
@@ -403,6 +494,23 @@ mod tests {
     use super::*;
 
     use std::collections::HashMap;
+
+    /// Unwraps the `find` arm of a parsed statement so the find tests
+    /// keep asserting on `FindStatement` directly.
+    fn find_statement(sql: &str) -> FindStatement {
+        match parse_statement(sql).expect("parsed") {
+            Statement::Find(statement) => statement,
+            other => panic!("expected a find statement, got {other:?}"),
+        }
+    }
+
+    /// Unwraps the `insert` arm of a parsed statement.
+    fn insert_statement(sql: &str) -> InsertStatement {
+        match parse_statement(sql).expect("parsed") {
+            Statement::Insert(statement) => statement,
+            other => panic!("expected an insert statement, got {other:?}"),
+        }
+    }
 
     #[test]
     fn driver_is_declared_not_thread_safe() {
@@ -437,20 +545,20 @@ mod tests {
 
     #[test]
     fn find_statements_parse_their_collection() {
-        let plain = parse_statement("find orders").expect("parsed");
+        let plain = find_statement("find orders");
         assert_eq!(plain.collection, "orders");
         assert!(plain.filter.is_none());
-        let spaced = parse_statement("  find  system.users  ").expect("parsed");
+        let spaced = find_statement("  find  system.users  ");
         assert_eq!(spaced.collection, "system.users");
         assert!(spaced.filter.is_none());
-        let filtered = parse_statement("find c1 with n = 3").expect("parsed");
+        let filtered = find_statement("find c1 with n = 3");
         assert_eq!(filtered.collection, "c1");
         assert_eq!(
             filtered.filter_document(&[]).expect("bind"),
             vec![("n".to_owned(), bson::Bson::Int32(3))]
         );
         // The filter text keeps its whitespace: string literals win.
-        let spaced = parse_statement("find c1 with txt = 'two  spaces'").expect("parsed");
+        let spaced = find_statement("find c1 with txt = 'two  spaces'");
         assert_eq!(
             spaced.filter_document(&[]).expect("bind"),
             vec![(
@@ -459,7 +567,7 @@ mod tests {
             )]
         );
         // Two placeholders bind to exactly the two supplied params.
-        let parameterized = parse_statement("find c1 with n = ? and tag = ?").expect("parsed");
+        let parameterized = find_statement("find c1 with n = ? and tag = ?");
         assert!(parameterized.filter_document(&[]).is_err());
         assert_eq!(
             parameterized
@@ -480,6 +588,46 @@ mod tests {
         assert!(parse_statement("find c1 with").is_err());
         assert!(parse_statement("find c1 with n = ? and").is_err());
         assert!(parse_statement("find $cmd").is_err());
+    }
+
+    #[test]
+    fn insert_statements_parse_their_collection() {
+        let statement = insert_statement(
+            r#"insert components with {"codeGroup":"1","listComponent":[{"codeComponent":"1"}]}"#,
+        );
+        assert_eq!(statement.collection, "components");
+        assert_eq!(
+            statement.document,
+            vec![
+                ("codeGroup".to_owned(), bson::Bson::String("1".to_owned())),
+                (
+                    "listComponent".to_owned(),
+                    bson::Bson::Array(vec![bson::Bson::Document(vec![(
+                        "codeComponent".to_owned(),
+                        bson::Bson::String("1".to_owned())
+                    )])]),
+                ),
+            ],
+            "the JSON document arrives as its BSON shape, field order intact"
+        );
+
+        let spaced = insert_statement(r#"  insert  vuce.landing  with {"a":1}  "#);
+        assert_eq!(spaced.collection, "vuce.landing");
+        assert_eq!(
+            spaced.document,
+            vec![("a".to_owned(), bson::Bson::Int32(1))]
+        );
+
+        // Structural failures stay client-side protocol errors: no
+        // collection, no `with`, no document, a non-object document, a
+        // malformed document, a `$` collection and stray tokens.
+        assert!(parse_statement("insert").is_err());
+        assert!(parse_statement("insert components").is_err());
+        assert!(parse_statement("insert components with").is_err());
+        assert!(parse_statement(r#"insert components with [{"a":1}]"#).is_err());
+        assert!(parse_statement(r#"insert components with {not json}"#).is_err());
+        assert!(parse_statement("insert $cmd with {}").is_err());
+        assert!(parse_statement("insert components oops with {}").is_err());
     }
 
     #[test]
