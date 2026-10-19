@@ -1,2 +1,7 @@
 /target
 Cargo.lock.bak
+
+# REA evidence snapshot (large, per-machine analysis output; the .md spec
+# IS committed next to it and is referenced by driver docs).
+/dbeaver-rea-analysis.evidence.json
+.atl/
