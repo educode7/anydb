@@ -90,13 +90,21 @@ impl MongoDriver {
     }
 }
 
+/// Target resolution: a full `mongodb://` connection string wins; an
+/// empty target synthesizes the equivalent URI from the `host` / `port`
+/// / `database` properties (the DBeaver host-port-database form).
 /// URL credentials win the user slot (properties only fill a missing
 /// user); `password` and `auth_source` are property-overridable
 /// (the secrets pipeline writes there). TLS policy comes from
 /// `ssl_mode` / `ssl_root_cert` settings.
 fn resolve_target(request: &OpenRequest) -> Result<MongoTarget, ConnectionError> {
     let user = request.properties.get("user").map(String::as_str);
-    let mut target = uri::parse_target(&request.target, user)?;
+    let url = if request.target.is_empty() {
+        host_port_target(&request.properties)?
+    } else {
+        request.target.clone()
+    };
+    let mut target = uri::parse_target(&url, user)?;
     if let Some(value) = request.properties.get("password") {
         target.password = Some(value.clone());
     }
@@ -116,6 +124,38 @@ fn resolve_target(request: &OpenRequest) -> Result<MongoTarget, ConnectionError>
         target.ssl_root_cert = Some(value.clone());
     }
     Ok(target)
+}
+
+/// Synthesizes a `mongodb://host:port/[database]` URL for the empty
+/// target case: `host` is required (the plain host-port-database form),
+/// `port` defaults to 27017, `database` defaults to the URI default
+/// (`admin`). The parse is delegated to `parse_target`, so validation
+/// stays in exactly one place.
+fn host_port_target(
+    properties: &std::collections::HashMap<String, String>,
+) -> Result<String, ConnectionError> {
+    let missing = || {
+        ConnectionError::Protocol(
+            "either a mongodb:// connection string or the 'host' property is required".to_owned(),
+        )
+    };
+    let host = properties.get("host").filter(|host| !host.is_empty());
+    let Some(host) = host else {
+        return Err(missing());
+    };
+    let port = match properties.get("port").filter(|port| !port.is_empty()) {
+        Some(port) => port
+            .parse::<u16>()
+            .map_err(|_| ConnectionError::Protocol(format!("invalid 'port' property: '{port}'")))?,
+        None => uri::DEFAULT_PORT,
+    };
+    let database = properties
+        .get("database")
+        .filter(|database| !database.is_empty());
+    Ok(match database {
+        Some(database) => format!("mongodb://{host}:{port}/{database}"),
+        None => format!("mongodb://{host}:{port}/"),
+    })
 }
 
 /// The supported statement form: `find <collection> [with <filter-text>]`.
@@ -457,6 +497,77 @@ mod tests {
         assert_eq!(target.user.as_deref(), Some("urluser"));
         assert_eq!(target.password.as_deref(), Some("ppass"));
         assert_eq!(target.auth_db, "pauth");
+    }
+
+    #[test]
+    fn resolve_target_synthesizes_the_host_port_database_form() {
+        // Empty target + host/port/database properties = the DBeaver
+        // host-port-database form.
+        let request = OpenRequest {
+            container_id: "c1".into(),
+            target: String::new(),
+            properties: HashMap::from([
+                ("host".to_owned(), "db.local".to_owned()),
+                ("port".to_owned(), "27018".to_owned()),
+                ("database".to_owned(), "vuce-landingz".to_owned()),
+                ("user".to_owned(), "adm".to_owned()),
+            ]),
+        };
+        let target = resolve_target(&request).expect("resolved");
+        assert_eq!(target.host, "db.local");
+        assert_eq!(target.port, 27018);
+        assert_eq!(target.auth_db, "vuce-landingz");
+        assert_eq!(target.user.as_deref(), Some("adm"));
+
+        // Port and database default when omitted (27017 / admin).
+        let request = OpenRequest {
+            container_id: "c1".into(),
+            target: String::new(),
+            properties: HashMap::from([("host".to_owned(), "localhost".to_owned())]),
+        };
+        let target = resolve_target(&request).expect("resolved");
+        assert_eq!(target.host, "localhost");
+        assert_eq!(target.port, 27017);
+        assert_eq!(target.auth_db, "admin");
+        assert_eq!(target.user, None);
+
+        // Neither a connection string nor 'host': client-side error.
+        let request = OpenRequest {
+            container_id: "c1".into(),
+            target: String::new(),
+            properties: HashMap::new(),
+        };
+        match resolve_target(&request) {
+            Ok(_) => panic!("nothing to connect to"),
+            Err(error) => assert!(
+                matches!(error, ConnectionError::Protocol(ref message) if message.contains("'host' property"))
+            ),
+        }
+
+        // A non-numeric port never reaches the wire.
+        let request = OpenRequest {
+            container_id: "c1".into(),
+            target: String::new(),
+            properties: HashMap::from([
+                ("host".to_owned(), "localhost".to_owned()),
+                ("port".to_owned(), "27abc".to_owned()),
+            ]),
+        };
+        assert!(resolve_target(&request).is_err());
+
+        // The full connection string keeps winning over the properties.
+        let request = OpenRequest {
+            container_id: "c1".into(),
+            target: "mongodb://stringhost:27019/stringdb".into(),
+            properties: HashMap::from([
+                ("host".to_owned(), "ignored.local".to_owned()),
+                ("port".to_owned(), "1".to_owned()),
+            ]),
+        };
+        let target = resolve_target(&request).expect("resolved");
+        assert_eq!(target.host, "stringhost");
+        assert_eq!(target.port, 27019);
+        assert_eq!(target.auth_db, "stringdb");
     }
 
     #[test]
