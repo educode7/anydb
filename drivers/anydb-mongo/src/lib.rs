@@ -19,6 +19,9 @@
 //! client-side WITH typed parameter values — mongo has no wire binding,
 //! so `?` placeholders interpolate nothing: see `filter`. Errors around
 //! arity and syntax are `Protocol`, raised before any wire round-trip.
+//! Multi-document ACID transactions require a replica-set session and
+//! are not wired: the `DataSource` transaction-control SPI methods use
+//! the trait's refusing defaults.
 //! The typed mapping converts every BSON value through the shared
 //! `TypedValue` contract, with extended-JSON rendering for embedded
 //! documents and ISO-8601 text for UTC datetimes.

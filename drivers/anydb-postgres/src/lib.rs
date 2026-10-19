@@ -2,7 +2,9 @@
 //! PostgreSQL driver: descriptor catalog + live factory. `open_data_source`
 //! dials a real wire-protocol v3 connection (see `protocol`); the resolved
 //! settings (secrets pipeline output) carry `user`/`password`/`database`
-//! overrides over the target URL credentials.
+//! overrides over the target URL credentials. Transaction control
+//! (`begin`/`commit`/`rollback`) runs over the live connection and is also
+//! exposed through the shared `DataSource` SPI.
 
 // `pub` modules: driver tests act as a server side (they recompute md5/scram
 // credentials), and advanced tooling can drive the wire layer directly.
@@ -328,6 +330,16 @@ impl DataSource for WireDataSource {
     ) -> Result<TypedStatementResult, ConnectionError> {
         let typed = WireDataSource::execute_cached_statement_typed(self, sql, params).await?;
         Ok(typed_statement_result(typed))
+    }
+
+    /// Explicit `BEGIN` over the live connection (Ready `T` afterwards).
+    async fn begin_transaction(&self) -> Result<(), ConnectionError> {
+        WireDataSource::begin_transaction(self).await
+    }
+
+    /// Explicit `COMMIT` over the live connection (Ready `I` afterwards).
+    async fn commit_transaction(&self) -> Result<(), ConnectionError> {
+        WireDataSource::commit_transaction(self).await
     }
 
     /// `ROLLBACK` over the live connection: normalizes the aborted

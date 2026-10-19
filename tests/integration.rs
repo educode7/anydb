@@ -446,6 +446,46 @@ impl Driver for RollbackDriver {
     }
 }
 
+// ---------- defaults of the SPI transaction control ----------
+
+/// Data source without any transaction override: the SPI contract
+/// degrades to `ConnectionError::DriverFailure` (query-only readers).
+struct NoTransactionSource;
+
+#[async_trait::async_trait]
+impl DataSource for NoTransactionSource {
+    fn metadata(&self) -> DataSourceMetadata {
+        DataSourceMetadata {
+            product_name: "Fake".into(),
+            product_version: "0".into(),
+            driver_name: "fake-no-txn".into(),
+        }
+    }
+
+    async fn ping(&self) -> ConnectionResult<()> {
+        Ok(())
+    }
+
+    async fn close(&self) {}
+}
+
+#[tokio::test]
+async fn drivers_without_transaction_semantics_refuse_by_default() {
+    let source: Arc<dyn DataSource> = Arc::new(NoTransactionSource);
+    for name in ["begin", "commit", "rollback"] {
+        let result = match name {
+            "begin" => source.begin_transaction().await,
+            "commit" => source.commit_transaction().await,
+            _ => source.rollback_transaction().await,
+        };
+        assert_eq!(
+            result,
+            Err(ConnectionError::DriverFailure),
+            "default '{name}' must refuse"
+        );
+    }
+}
+
 // ---------- typed statement execution through the pipeline ----------
 
 /// Data source with a typed catalog behavior: the first typed execution
