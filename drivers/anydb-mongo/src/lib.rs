@@ -28,6 +28,21 @@
 //! An insert binds nothing, so it takes no parameters, and it never
 //! pages — cursor paging answers `Protocol` for it.
 //!
+//! The destructive half is
+//! `"delete <collection> with <filter-text>"` and
+//! `"update <collection> with <filter-text> set <json-document>"`: the
+//! filter is required (a filter-less delete never parses), the delete
+//! removes every match, and the update touches every match
+//! (`upsert: false, multi: true`) with the JSON update spec traveling
+//! verbatim as `u`. Write results carry a legible acceptance message
+//! next to the tag/count ("delete coll: 1 document(s) removed",
+//! "update coll: 3 matched, 3 modified") — a destructive statement is
+//! never observable only through counters. A delete fires ONLY through
+//! the confirmed execution seam (the `DataSource`
+//! `execute_statement_typed_confirmed` SPI method; the ordinary typed
+//! surface answers `Protocol` naming the seam before any wire bytes),
+//! the DBeaver destructive-SQL-confirmation analog.
+//!
 //! Multi-document ACID transactions require a replica-set session and
 //! are not wired: the `DataSource` transaction-control SPI methods use
 //! the trait's refusing defaults.
@@ -191,12 +206,57 @@ pub struct InsertStatement {
     document: bson::Document,
 }
 
-/// Both statement forms a mongo connection accepts. `find` pages
-/// (fetch-all or a suspended cursor); `insert` never pages.
+/// `delete <collection> with <filter-text>`: the filter is REQUIRED (a
+/// filter-less delete would match everything — that shape is a protocol
+/// error, never a fireable statement).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeleteStatement {
+    pub collection: String,
+    filter: filter::Filter,
+}
+
+impl DeleteStatement {
+    /// Compiles the `with` filter into its BSON document with the
+    /// statement parameters bound; the filter always exists, so every
+    /// parameter lands in the compiled document.
+    fn filter_document(
+        &self,
+        params: &[QueryParameter],
+    ) -> Result<bson::Document, ConnectionError> {
+        self.filter.document(params)
+    }
+}
+
+/// `update <collection> with <filter-text> set <json-document>`: the
+/// filter is REQUIRED and the JSON document is mongo's update spec
+/// (`u`) verbatim — an operator document (`{"$set": ...}`) applies
+/// fields, a plain document replaces the matches wholesale.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UpdateStatement {
+    pub collection: String,
+    filter: filter::Filter,
+    document: bson::Document,
+}
+
+impl UpdateStatement {
+    /// Same filter contract as delete: the filter always exists.
+    fn filter_document(
+        &self,
+        params: &[QueryParameter],
+    ) -> Result<bson::Document, ConnectionError> {
+        self.filter.document(params)
+    }
+}
+
+/// The statement forms a mongo connection accepts. `find` pages
+/// (fetch-all or a suspended cursor); `delete` travels only behind the
+/// confirmed execution seam; `insert` and `update` never page.
 #[derive(Debug)]
 pub enum Statement {
     Find(FindStatement),
     Insert(InsertStatement),
+    Delete(DeleteStatement),
+    Update(UpdateStatement),
 }
 
 impl FindStatement {
@@ -224,15 +284,19 @@ fn statement_protocol(message: String) -> ConnectionError {
     ConnectionError::Protocol(format!("unsupported statement: {message}"))
 }
 
-/// Parses `find <collection> [with <filter-text>]` and
-/// `insert <collection> with <json-document>` by slicing the raw SQL:
-/// the command word and collection are single tokens, everything after
-/// a standalone `with` is the verbatim filter text or the verbatim
-/// document text. Both forms resolve completely client-side.
+/// Parses `find <collection> [with <filter-text>]`,
+/// `insert <collection> with <json-document>`,
+/// `delete <collection> with <filter-text>` and
+/// `update <collection> with <filter-text> set <json-document>` by
+/// slicing the raw SQL: the command word and collection are single
+/// tokens, everything after a standalone `with` is the verbatim filter
+/// text or the verbatim document text (the update splits on the first
+/// quote-aware standalone `set`). All forms resolve completely
+/// client-side.
 fn parse_statement(sql: &str) -> Result<Statement, ConnectionError> {
     fn unsupported() -> ConnectionError {
         statement_protocol(
-            "mongo statements are 'find <collection> [with <filter>]' or 'insert <collection> with <document>'"
+            "mongo statements are 'find <collection> [with <filter>]', 'insert <collection> with <document>', 'delete <collection> with <filter>' or 'update <collection> with <filter> set <document>'"
                 .to_owned(),
         )
     }
@@ -242,7 +306,7 @@ fn parse_statement(sql: &str) -> Result<Statement, ConnectionError> {
     let Some((command, tail)) = sql.split_once(char::is_whitespace) else {
         return Err(unsupported());
     };
-    if command != "find" && command != "insert" {
+    if command != "find" && command != "insert" && command != "delete" && command != "update" {
         return Err(unsupported());
     }
     let (collection, remainder) = match tail.trim_start().split_once(char::is_whitespace) {
@@ -272,9 +336,47 @@ fn parse_statement(sql: &str) -> Result<Statement, ConnectionError> {
                 ));
             }
             let text = parts.next().unwrap_or_default().trim_start();
-            let document = document::parse_document_literal(text)?;
+            let document = document::parse_document_literal(text, "insert")?;
             Ok(Statement::Insert(InsertStatement {
                 collection: collection.to_owned(),
+                document,
+            }))
+        }
+        "delete" => {
+            if remainder.is_empty() {
+                return Err(statement_protocol(
+                    "delete statements are 'delete <collection> with <filter>'".to_owned(),
+                ));
+            }
+            // A delete always carries the compiled filter: a filter-less
+            // delete would match everything, so that shape is never a
+            // statement (empty filter text dies in the filter parser,
+            // exactly like `'find c with'`).
+            let text = parts.next().unwrap_or_default().trim_start();
+            let filter = filter::parse_filter(text)?;
+            Ok(Statement::Delete(DeleteStatement {
+                collection: collection.to_owned(),
+                filter,
+            }))
+        }
+        "update" => {
+            if remainder.is_empty() {
+                return Err(update_form_error());
+            }
+            let tail = parts.next().unwrap_or_default().trim_start();
+            // Quote-aware scan: the real `set` separator is the first
+            // whitespace-standalone `set` outside both quote kinds.
+            let Some((filter_text, document_text)) = update_split(tail) else {
+                return Err(update_form_error());
+            };
+            if filter_text.trim().is_empty() || document_text.trim().is_empty() {
+                return Err(update_form_error());
+            }
+            let filter = filter::parse_filter(filter_text.trim())?;
+            let document = document::parse_document_literal(document_text, "update")?;
+            Ok(Statement::Update(UpdateStatement {
+                collection: collection.to_owned(),
+                filter,
                 document,
             }))
         }
@@ -294,6 +396,69 @@ fn parse_statement(sql: &str) -> Result<Statement, ConnectionError> {
             }))
         }
     }
+}
+
+/// Splits the `update` tail at the first whitespace-standalone `set`
+/// token that is OUTSIDE both quote kinds (the filter grammar quotes
+/// strings with `'` or `"` and escapes by doubling, so `'my set'` and
+/// `"a''set''b"` never split the statement). Returns the raw SQL slices:
+/// `(filter_text, document_text)`; the document text keeps its leading
+/// whitespace (the JSON object parser skips it).
+fn update_split(tail: &str) -> Option<(&str, &str)> {
+    let mut in_string: Option<char> = None;
+    let mut token = String::new();
+    let mut token_start: Option<usize> = None;
+    let mut chars = tail.char_indices().peekable();
+    while let Some((index, ch)) = chars.next() {
+        if let Some(quote) = in_string {
+            if ch == quote {
+                // A doubled quote is the escape; a single one closes
+                // the string.
+                let doubled = matches!(chars.peek(), Some((_, next)) if *next == quote);
+                if doubled {
+                    chars.next();
+                } else {
+                    in_string = None;
+                }
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => {
+                token.clear();
+                token_start = None;
+                in_string = Some(ch);
+            }
+            c if c.is_whitespace() => {
+                if token == "set" {
+                    return Some((&tail[..token_start.unwrap_or(index)], &tail[index..]));
+                }
+                token.clear();
+                token_start = None;
+            }
+            c => {
+                if token_start.is_none() {
+                    token_start = Some(index);
+                }
+                token.push(c);
+            }
+        }
+    }
+    // A `set` closing the statement itself (`update c with ... set`)
+    // still splits: the document text is empty and dies in the JSON
+    // parser's update form error.
+    if token == "set" {
+        return Some((&tail[..token_start.unwrap_or(0)], &tail[tail.len()..]));
+    }
+    None
+}
+
+/// The update form hint, raised for every shape that does not reach a
+/// parsed `update ... with <filter> set <json-document>`.
+fn update_form_error() -> ConnectionError {
+    statement_protocol(
+        "update statements are 'update <collection> with <filter> set <document>'".to_owned(),
+    )
 }
 
 /// Live data source over exactly one wire connection; commands serialize
@@ -340,6 +505,7 @@ impl WireDataSource {
             &documents,
             Some(&format!("find {affected}")),
             Some(affected),
+            None,
         ))
     }
 
@@ -371,6 +537,64 @@ impl WireDataSource {
             rows: Vec::new(),
             command_tag: Some(format!("insert {inserted}")),
             affected_rows: Some(inserted),
+            message: None,
+        })
+    }
+
+    /// Typed delete core: the filter compiles and binds BEFORE the
+    /// connection is locked. The visible acceptance carries both the
+    /// tag/count contract of the other write forms and what happened
+    /// in words, so a caller never has to re-parse a tag to answer
+    /// "what got wiped?".
+    async fn delete_typed(
+        &self,
+        statement: &DeleteStatement,
+        params: &[QueryParameter],
+    ) -> Result<TypedStatementResult, ConnectionError> {
+        let filter = statement.filter_document(params)?;
+        let mut guard = self.connection.lock().await;
+        let Some(connection) = guard.as_mut() else {
+            return Err(ConnectionError::DriverFailure);
+        };
+        let removed = connection.delete(&statement.collection, &filter).await?;
+        Ok(TypedStatementResult {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            command_tag: Some(format!("delete {removed}")),
+            affected_rows: Some(removed),
+            message: Some(format!(
+                "delete {}: {removed} document(s) removed",
+                statement.collection
+            )),
+        })
+    }
+
+    /// Typed update core: filter compiles and binds first; the JSON
+    /// update spec travels verbatim as `u` (upsert off, multi on — SQL
+    /// UPDATE semantics). The acceptance reports matched and modified
+    /// counts separately, in words.
+    async fn update_typed(
+        &self,
+        statement: &UpdateStatement,
+        params: &[QueryParameter],
+    ) -> Result<TypedStatementResult, ConnectionError> {
+        let filter = statement.filter_document(params)?;
+        let mut guard = self.connection.lock().await;
+        let Some(connection) = guard.as_mut() else {
+            return Err(ConnectionError::DriverFailure);
+        };
+        let (matched, modified) = connection
+            .update(&statement.collection, &filter, &statement.document)
+            .await?;
+        Ok(TypedStatementResult {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            command_tag: Some(format!("update {modified}")),
+            affected_rows: Some(modified),
+            message: Some(format!(
+                "update {}: {matched} matched, {modified} modified",
+                statement.collection
+            )),
         })
     }
 
@@ -389,7 +613,7 @@ impl WireDataSource {
     ) -> Result<WirePage, ConnectionError> {
         let statement = match parse_statement(sql)? {
             Statement::Find(statement) => statement,
-            Statement::Insert(_) => {
+            Statement::Insert(_) | Statement::Delete(_) | Statement::Update(_) => {
                 return Err(ConnectionError::Protocol(
                     "cursor paging requires a find statement".to_owned(),
                 ));
@@ -454,13 +678,18 @@ impl DataSource for WireDataSource {
                 .collect(),
             command_tag: typed.command_tag,
             affected_rows: typed.affected_rows,
+            message: typed.message,
         })
     }
 
     /// Typed execution: `find <collection> [with <filter>]` with `?`
     /// parameters bound to typed BSON values client-side, or
     /// `insert <collection> with <json-document>` whose JSON document
-    /// IS the payload (an insert takes no parameters).
+    /// IS the payload (an insert takes no parameters). A `delete`
+    /// statement refuses here — destructive statements travel only
+    /// behind `execute_statement_typed_confirmed` — while `update`
+    /// executes from the ordinary path (the confirmation seam is scoped
+    /// to delete).
     async fn execute_statement_typed(
         &self,
         sql: &str,
@@ -469,6 +698,28 @@ impl DataSource for WireDataSource {
         match parse_statement(sql)? {
             Statement::Find(statement) => self.find_typed(&statement, params).await,
             Statement::Insert(statement) => self.insert_typed(&statement, params).await,
+            Statement::Delete(_) => Err(ConnectionError::Protocol(
+                "delete statements are destructive: call execute_statement_typed_confirmed on the data source to run a delete"
+                    .to_owned(),
+            )),
+            Statement::Update(statement) => self.update_typed(&statement, params).await,
+        }
+    }
+
+    /// The confirmed execution seam: the only wire route of a delete.
+    /// Every other statement form executes identically through both
+    /// paths, so the ordinary typed surface stays the one contract for
+    /// everything non-destructive.
+    async fn execute_statement_typed_confirmed(
+        &self,
+        sql: &str,
+        params: &[QueryParameter],
+    ) -> Result<TypedStatementResult, ConnectionError> {
+        match parse_statement(sql)? {
+            Statement::Find(statement) => self.find_typed(&statement, params).await,
+            Statement::Insert(statement) => self.insert_typed(&statement, params).await,
+            Statement::Delete(statement) => self.delete_typed(&statement, params).await,
+            Statement::Update(statement) => self.update_typed(&statement, params).await,
         }
     }
 

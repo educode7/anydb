@@ -1,9 +1,11 @@
 //! JSON document literal for the `insert <collection> with <document>`
-//! statement (the write-side sibling of the `find ... with <filter>`
+//! statement and the `update <collection> with <filter> set <document>`
+//! update spec (the write-side siblings of the `find ... with <filter>`
 //! text in `filter`).
 //!
 //! The accepted text is RFC 8259 JSON restricted to an OBJECT at the
-//! top level: mongo inserts documents, never arrays or scalars. Nested
+//! top level: mongo inserts documents, never arrays or scalars; the
+//! update spec (`u`) follows the same shape. Nested
 //! objects and arrays, double-quoted keys and strings with JSON
 //! backslash escapes, numbers, `true`, `false` and `null`. Numbers take
 //! the same BSON shape as a filter literal (shared `number_literal`),
@@ -20,34 +22,33 @@ use anydb_shared::ConnectionError;
 
 use crate::bson::{Bson, Document, number_literal};
 
-/// Parses one JSON object into a BSON document.
-pub fn parse_document_literal(text: &str) -> Result<Document, ConnectionError> {
-    let mut parser = Parser::new(text);
+/// Parses one JSON object into a BSON document with the caller's error
+/// context (`insert` / `update` — the statement's command word names the
+/// failure, identical grammar otherwise).
+pub fn parse_document_literal(
+    text: &str,
+    context: &'static str,
+) -> Result<Document, ConnectionError> {
+    let mut parser = Parser::new(text, context);
     parser.skip_whitespace();
     if parser.peek() != Some('{') {
-        return Err(protocol(
-            "expected a JSON object at the top level of an insert document".to_owned(),
-        ));
+        return Err(parser.protocol(format!(
+            "expected a JSON object at the top level of a {context} document"
+        )));
     }
     let document = parser.parse_object()?;
     parser.skip_whitespace();
     if parser.peek().is_some() {
-        return Err(protocol(
-            "unexpected trailing text after the JSON object".to_owned(),
-        ));
+        return Err(parser.protocol("unexpected trailing text after the JSON object".to_owned()));
     }
     Ok(document)
 }
 
-fn protocol(message: String) -> ConnectionError {
-    ConnectionError::Protocol(format!("mongo insert document: {message}"))
-}
-
 /// Re-contextualizes a shared helper's error (the numeric shape lives
 /// in `bson`, the statement prefix belongs to the caller).
-fn contextualize(error: ConnectionError) -> ConnectionError {
+fn contextualize(context: &'static str, error: ConnectionError) -> ConnectionError {
     match error {
-        ConnectionError::Protocol(message) => protocol(message),
+        ConnectionError::Protocol(message) => Parser::prefix(context, message),
         other => other,
     }
 }
@@ -57,14 +58,26 @@ fn contextualize(error: ConnectionError) -> ConnectionError {
 struct Parser {
     text: Vec<char>,
     position: usize,
+    /// Error context of the owning statement ("insert" / "update").
+    context: &'static str,
 }
 
 impl Parser {
-    fn new(text: &str) -> Self {
+    fn new(text: &str, context: &'static str) -> Self {
         Self {
             text: text.chars().collect(),
             position: 0,
+            context,
         }
+    }
+
+    /// Statement-prefixed protocol error: `mongo <context> document: <message>`.
+    fn protocol(&self, message: String) -> ConnectionError {
+        Self::prefix(self.context, message)
+    }
+
+    fn prefix(context: &str, message: String) -> ConnectionError {
+        ConnectionError::Protocol(format!("mongo {context} document: {message}"))
     }
 
     fn peek(&self) -> Option<char> {
@@ -101,16 +114,13 @@ impl Parser {
             let key = match self.peek() {
                 Some('"') => self.parse_string()?,
                 _ => {
-                    return Err(protocol(
-                        "expected a field name (a double-quoted JSON key)".to_owned(),
-                    ));
+                    return Err(self
+                        .protocol("expected a field name (a double-quoted JSON key)".to_owned()));
                 }
             };
             self.skip_whitespace();
             if self.peek() != Some(':') {
-                return Err(protocol(format!(
-                    "expected ':' after the field name '{key}'"
-                )));
+                return Err(self.protocol(format!("expected ':' after the field name '{key}'")));
             }
             self.position += 1;
             self.skip_whitespace();
@@ -124,12 +134,12 @@ impl Parser {
                     return Ok(document);
                 }
                 None => {
-                    return Err(protocol(format!(
+                    return Err(self.protocol(format!(
                         "expected '}}' to close the object holding the field '{key}'"
                     )));
                 }
                 Some(found) => {
-                    return Err(protocol(format!(
+                    return Err(self.protocol(format!(
                         "unexpected '{found}': expected ',' or '}}' after the value of the field '{key}'"
                     )));
                 }
@@ -157,9 +167,9 @@ impl Parser {
                     self.position += 1;
                     return Ok(items);
                 }
-                None => return Err(protocol("expected ']' to close the array".to_owned())),
+                None => return Err(self.protocol("expected ']' to close the array".to_owned())),
                 Some(found) => {
-                    return Err(protocol(format!(
+                    return Err(self.protocol(format!(
                         "unexpected '{found}': expected ',' or ']' after an array value"
                     )));
                 }
@@ -179,15 +189,16 @@ impl Parser {
                     "true" => Ok(Bson::Boolean(true)),
                     "false" => Ok(Bson::Boolean(false)),
                     "null" => Ok(Bson::Null),
-                    _ => Err(protocol(format!(
+                    _ => Err(self.protocol(format!(
                         "expected a value, found the bare identifier '{word}'"
                     ))),
                 }
             }
-            Some(found) => Err(protocol(format!("expected a value, found '{found}'"))),
-            None => Err(protocol(
-                "expected a value, found the end of the document text".to_owned(),
-            )),
+            Some(found) => Err(self.protocol(format!("expected a value, found '{found}'"))),
+            None => {
+                Err(self
+                    .protocol("expected a value, found the end of the document text".to_owned()))
+            }
         }
     }
 
@@ -202,18 +213,18 @@ impl Parser {
         let integer_start = self.position;
         self.skip_digits();
         if self.position == integer_start {
-            return Err(protocol(
-                "invalid number literal: expected a digit after '-'".to_owned(),
-            ));
+            return Err(
+                self.protocol("invalid number literal: expected a digit after '-'".to_owned())
+            );
         }
         if self.peek() == Some('.') {
             self.position += 1;
             let fraction_start = self.position;
             self.skip_digits();
             if self.position == fraction_start {
-                return Err(protocol(
-                    "invalid number literal: expected a digit after '.'".to_owned(),
-                ));
+                return Err(
+                    self.protocol("invalid number literal: expected a digit after '.'".to_owned())
+                );
             }
         }
         if matches!(self.peek(), Some('e') | Some('E')) {
@@ -224,13 +235,13 @@ impl Parser {
             let exponent_start = self.position;
             self.skip_digits();
             if self.position == exponent_start {
-                return Err(protocol(
+                return Err(self.protocol(
                     "invalid number literal: expected a digit in the exponent".to_owned(),
                 ));
             }
         }
         let raw: String = self.text[start..self.position].iter().collect();
-        number_literal(&raw).map_err(contextualize)
+        number_literal(&raw).map_err(|error| contextualize(self.context, error))
     }
 
     fn skip_digits(&mut self) {
@@ -255,7 +266,7 @@ impl Parser {
         let mut text = String::new();
         loop {
             match self.peek() {
-                None => return Err(protocol("unterminated string literal".to_owned())),
+                None => return Err(self.protocol("unterminated string literal".to_owned())),
                 Some('"') => {
                     self.position += 1;
                     return Ok(text);
@@ -274,7 +285,7 @@ impl Parser {
 
     fn read_escape(&mut self) -> Result<String, ConnectionError> {
         let Some(escape) = self.bump() else {
-            return Err(protocol("unterminated string literal".to_owned()));
+            return Err(self.protocol("unterminated string literal".to_owned()));
         };
         match escape {
             '"' => Ok(String::from('"')),
@@ -286,7 +297,7 @@ impl Parser {
             'r' => Ok(String::from('\r')),
             't' => Ok(String::from('\t')),
             'u' => self.read_unicode_escape(),
-            other => Err(protocol(format!("invalid string escape '\\{other}'"))),
+            other => Err(self.protocol(format!("invalid string escape '\\{other}'"))),
         }
     }
 
@@ -297,26 +308,26 @@ impl Parser {
         let first = self.read_hex_quad()?;
         let scalar = if (0xD800..=0xDBFF).contains(&first) {
             if self.peek() != Some('\\') {
-                return Err(protocol(
+                return Err(self.protocol(
                     "a high surrogate \\u escape must be followed by a low surrogate".to_owned(),
                 ));
             }
             self.position += 1;
             if self.peek() != Some('u') {
-                return Err(protocol(
+                return Err(self.protocol(
                     "a high surrogate \\u escape must be followed by a low surrogate".to_owned(),
                 ));
             }
             self.position += 1;
             let second = self.read_hex_quad()?;
             if !(0xDC00..=0xDFFF).contains(&second) {
-                return Err(protocol(
+                return Err(self.protocol(
                     "a high surrogate \\u escape must be followed by a low surrogate".to_owned(),
                 ));
             }
             0x10000 + ((first - 0xD800) << 10) + (second - 0xDC00)
         } else if (0xDC00..=0xDFFF).contains(&first) {
-            return Err(protocol(
+            return Err(self.protocol(
                 "a low surrogate \\u escape has no preceding high surrogate".to_owned(),
             ));
         } else {
@@ -324,16 +335,16 @@ impl Parser {
         };
         char::from_u32(scalar)
             .map(|found| found.to_string())
-            .ok_or_else(|| protocol(format!("invalid '\\u' escape value {scalar:#x}")))
+            .ok_or_else(|| self.protocol(format!("invalid '\\u' escape value {scalar:#x}")))
     }
 
     fn read_hex_quad(&mut self) -> Result<u32, ConnectionError> {
         let mut value = 0u32;
         for _ in 0..4 {
             let Some(digit) = self.peek().and_then(|found| found.to_digit(16)) else {
-                return Err(protocol(
-                    "expected four hex digits after the '\\u' escape".to_owned(),
-                ));
+                return Err(
+                    self.protocol("expected four hex digits after the '\\u' escape".to_owned())
+                );
             };
             value = value * 16 + digit;
             self.position += 1;
@@ -347,11 +358,11 @@ mod tests {
     use super::*;
 
     fn document(text: &str) -> Document {
-        parse_document_literal(text).expect("document literal parses")
+        parse_document_literal(text, "insert").expect("document literal parses")
     }
 
     fn protocol_error(text: &str) -> String {
-        match parse_document_literal(text) {
+        match parse_document_literal(text, "insert") {
             Err(ConnectionError::Protocol(message)) => message,
             other => panic!("expected a protocol error, got {other:?}"),
         }

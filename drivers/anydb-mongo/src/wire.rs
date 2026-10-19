@@ -119,10 +119,11 @@ fn int32_field(document: &Document, key: &str) -> i32 {
     }
 }
 
-/// Inserted count of an `insert` reply (`n`): a server counter arrives
-/// as Int32 or Int64 (Double tolerated for robustness). A reply without
-/// a count is a protocol error, never a silently successful zero.
-fn count_field(document: &Document, key: &str) -> Result<i64, ConnectionError> {
+/// Server count of a write reply (`n`, `nModified`, ...): a server
+/// counter arrives as Int32 or Int64 (Double tolerated for robustness).
+/// A reply without a count is a protocol error, never a silently
+/// successful zero.
+fn count_field(document: &Document, key: &str, context: &str) -> Result<i64, ConnectionError> {
     let found = document
         .iter()
         .find(|(field_key, _)| field_key == key)
@@ -132,10 +133,31 @@ fn count_field(document: &Document, key: &str) -> Result<i64, ConnectionError> {
         Some(Bson::Int64(value)) => Ok(*value),
         Some(Bson::Double(value)) => Ok(*value as i64),
         Some(_) => Err(protocol(format!(
-            "'{key}' in the insert reply is not a count"
+            "'{key}' in the {context} reply is not a count"
         ))),
         None => Err(protocol(format!(
-            "the insert reply carries no '{key}' count"
+            "the {context} reply carries no '{key}' count"
+        ))),
+    }
+}
+
+/// `writeErrors` of a write reply accompany `ok: 1` (mongo's
+/// ordered-write reply shape), so they are read out of the reply
+/// explicitly and surfaced as command errors — a rejected write never
+/// reads as a successful one. A differently-shaped payload is a
+/// protocol error naming the context.
+fn write_errors(reply: &Document, context: &str) -> Result<(), ConnectionError> {
+    match reply.iter().find(|(key, _)| key == "writeErrors") {
+        None => Ok(()),
+        Some((_, Bson::Array(errors))) => match errors.first() {
+            None => Ok(()),
+            Some(Bson::Document(error)) => Err(command_error(error)),
+            Some(_) => Err(protocol(format!(
+                "malformed writeErrors payload in the {context} reply"
+            ))),
+        },
+        Some(_) => Err(protocol(format!(
+            "malformed writeErrors payload in the {context} reply"
         ))),
     }
 }
@@ -533,24 +555,64 @@ impl Connection {
             ),
         ]);
         let reply = self.command(&command).await?;
-        match reply.iter().find(|(key, _)| key == "writeErrors") {
-            None => {}
-            Some((_, Bson::Array(errors))) => match errors.first() {
-                None => {}
-                Some(Bson::Document(error)) => return Err(command_error(error)),
-                Some(_) => {
-                    return Err(protocol(
-                        "malformed writeErrors payload in the insert reply".to_owned(),
-                    ));
-                }
-            },
-            Some(_) => {
-                return Err(protocol(
-                    "malformed writeErrors payload in the insert reply".to_owned(),
-                ));
-            }
-        }
-        count_field(&reply, "n")
+        write_errors(&reply, "insert")?;
+        count_field(&reply, "n", "insert")
+    }
+
+    /// `delete` command: the compiled filter as the one query selector
+    /// with `limit: 0` (every matching document goes — SQL DELETE
+    /// semantics), one round-trip. Returns the server's removed count
+    /// (`n`); `writeErrors` and a missing count surface as failures.
+    pub async fn delete(
+        &mut self,
+        collection: &str,
+        filter: &Document,
+    ) -> Result<i64, ConnectionError> {
+        let command = Document::from(vec![
+            ("delete".to_owned(), Bson::String(collection.to_owned())),
+            (
+                "deletes".to_owned(),
+                Bson::Array(vec![Bson::Document(Document::from(vec![
+                    ("q".to_owned(), Bson::Document(filter.clone())),
+                    ("limit".to_owned(), Bson::Int32(0)),
+                ]))]),
+            ),
+        ]);
+        let reply = self.command(&command).await?;
+        write_errors(&reply, "delete")?;
+        count_field(&reply, "n", "delete")
+    }
+
+    /// `update` command: the compiled filter as the one query selector,
+    /// the JSON statement document as mongo's update spec (`u`) VERBATIM
+    /// (operator document applies fields; a plain document replaces the
+    /// matches wholesale), `multi: true` (SQL UPDATE semantics) and
+    /// `upsert: false` (no filter miss mints documents), one round-trip.
+    /// Returns the matched (`n`) and modified (`nModified`) counts;
+    /// `writeErrors` and either missing count surface as failures.
+    pub async fn update(
+        &mut self,
+        collection: &str,
+        filter: &Document,
+        update: &Document,
+    ) -> Result<(i64, i64), ConnectionError> {
+        let command = Document::from(vec![
+            ("update".to_owned(), Bson::String(collection.to_owned())),
+            (
+                "updates".to_owned(),
+                Bson::Array(vec![Bson::Document(Document::from(vec![
+                    ("q".to_owned(), Bson::Document(filter.clone())),
+                    ("u".to_owned(), Bson::Document(update.clone())),
+                    ("upsert".to_owned(), Bson::Boolean(false)),
+                    ("multi".to_owned(), Bson::Boolean(true)),
+                ]))]),
+            ),
+        ]);
+        let reply = self.command(&command).await?;
+        write_errors(&reply, "update")?;
+        let matched = count_field(&reply, "n", "update")?;
+        let modified = count_field(&reply, "nModified", "update")?;
+        Ok((matched, modified))
     }
 
     /// Keepalive command (`{ping: 1}`), the whole driver surface the
@@ -600,12 +662,13 @@ pub struct TypedPage {
 /// is schemaless), command tag / affected rows only when drained.
 pub fn typed_page(page: &CursorPage) -> TypedPage {
     let result = if page.suspended {
-        bson::documents_to_result(&page.documents, None, None)
+        bson::documents_to_result(&page.documents, None, None, None)
     } else {
         bson::documents_to_result(
             &page.documents,
             Some(&format!("find {}", page.total)),
             Some(page.total),
+            None,
         )
     };
     TypedPage {

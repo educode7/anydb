@@ -554,6 +554,7 @@ pub fn documents_to_result(
     documents: &[Document],
     command_tag: Option<&str>,
     affected_rows: Option<i64>,
+    message: Option<String>,
 ) -> TypedStatementResult {
     let mut columns: Vec<String> = Vec::new();
     for document in documents {
@@ -582,6 +583,7 @@ pub fn documents_to_result(
         rows,
         command_tag: command_tag.map(|tag| tag.to_owned()),
         affected_rows,
+        message,
     }
 }
 
@@ -1021,7 +1023,7 @@ mod tests {
             ("b".to_owned(), Bson::Int32(3)),
             ("c".to_owned(), Bson::Int64(4)),
         ]);
-        let result = documents_to_result(&[first, second], Some("find 2"), Some(2));
+        let result = documents_to_result(&[first, second], Some("find 2"), Some(2), None);
         assert_eq!(result.columns, vec!["a", "b", "c"]);
         assert_eq!(
             result.rows,

@@ -1,5 +1,7 @@
-//! The mongo statement surface: `find <collection> with <filter-text>`
-//! and `insert <collection> with <json-document>`.
+//! The mongo statement surface: `find <collection> with <filter-text>`,
+//! `insert <collection> with <json-document>`,
+//! `delete <collection> with <filter-text>` and
+//! `update <collection> with <filter-text> set <json-document>`.
 //!
 //! Filters compile to a BSON document client-side with `?` parameters
 //! bound to typed values. The fake mongod asserts the exact filter
@@ -11,6 +13,13 @@
 //! error, and that every insert failure is client-side (the
 //! handshake-only server panics on any command, so a Protocol verdict
 //! there proves no frame was ever written).
+//!
+//! The delete/update half proves the destructive write surface: the
+//! delete travels only behind the confirmed execution seam (the
+//! ordinary typed surface refuses pre-wire), the update spec travels
+//! verbatim with upsert off and multi on, both results carry a legible
+//! acceptance message, and the update's `set` separator never splits a
+//! quoted filter value.
 
 use std::future::Future;
 
@@ -1012,7 +1021,7 @@ async fn insert_failures_never_reach_the_wire() {
         .expect_err("missing collection");
     assert!(protocol_error(
         error,
-        "mongo statements are 'find <collection> [with <filter>]' or 'insert <collection> with <document>'"
+        "mongo statements are 'find <collection> [with <filter>]', 'insert <collection> with <document>', 'delete <collection> with <filter>' or 'update <collection> with <filter> set <document>'"
     ));
 
     // The handshake-only server answers `ok: 0` to any command it does
@@ -1032,6 +1041,488 @@ async fn paging_rejects_insert_statements() {
     assert!(
         protocol_error(error, "cursor paging requires a find statement"),
         "paging must reject the statement client-side, got nothing"
+    );
+
+    drop(server);
+}
+
+// ---------- delete / update write statements --------------------------
+
+fn delete_reply(removed: i32) -> Document {
+    Document::from(vec![
+        ("ok".to_owned(), int32(1)),
+        ("n".to_owned(), int32(removed)),
+    ])
+}
+
+fn update_reply(matched: i32, modified: i32) -> Document {
+    Document::from(vec![
+        ("ok".to_owned(), int32(1)),
+        ("n".to_owned(), int32(matched)),
+        ("nModified".to_owned(), int32(modified)),
+    ])
+}
+
+/// Handshake + exactly one `delete` command: asserts the full wire
+/// shape (the compiled filter as the only selector with `limit: 0`,
+/// the `$db` argument), then replies.
+async fn delete_server(stream: TcpStream, expected_filter: Document, reply: Document) {
+    let mut stream = stream;
+    handshake(&mut stream).await;
+    let Some((request_id, command)) = read_frame(&mut stream).await else {
+        panic!("delete command read");
+    };
+    assert_eq!(first_command(&command), "delete");
+    assert_eq!(
+        field(&command, "delete"),
+        &Bson::String("components".to_owned()),
+        "the command targets the statement's collection"
+    );
+    assert_eq!(
+        field(&command, "deletes"),
+        &Bson::Array(vec![Bson::Document(vec![
+            ("q".to_owned(), Bson::Document(expected_filter)),
+            ("limit".to_owned(), int32(0)),
+        ])]),
+        "deletes carries the compiled filter as the only selector \
+         with the remove-all limit"
+    );
+    assert_eq!(
+        field(&command, "$db"),
+        &Bson::String("admin".to_owned()),
+        "every OP_MSG request carries the $db argument"
+    );
+    write_frame(&mut stream, request_id, &reply).await;
+}
+
+/// Handshake + exactly one `update` command: asserts the update spec
+/// (`u`) travels verbatim with `upsert: false, multi: true` and the
+/// compiled filter as the only selector, then replies.
+async fn update_server(
+    stream: TcpStream,
+    expected_filter: Document,
+    expected_update: Document,
+    reply: Document,
+) {
+    let mut stream = stream;
+    handshake(&mut stream).await;
+    let Some((request_id, command)) = read_frame(&mut stream).await else {
+        panic!("update command read");
+    };
+    assert_eq!(first_command(&command), "update");
+    assert_eq!(
+        field(&command, "update"),
+        &Bson::String("components".to_owned()),
+        "the command targets the statement's collection"
+    );
+    assert_eq!(
+        field(&command, "updates"),
+        &Bson::Array(vec![Bson::Document(vec![
+            ("q".to_owned(), Bson::Document(expected_filter)),
+            ("u".to_owned(), Bson::Document(expected_update)),
+            ("upsert".to_owned(), Bson::Boolean(false)),
+            ("multi".to_owned(), Bson::Boolean(true)),
+        ])]),
+        "updates carries the statement's filter and update spec \
+         with the all-matching, never-upserting flags"
+    );
+    assert_eq!(
+        field(&command, "$db"),
+        &Bson::String("admin".to_owned()),
+        "every OP_MSG request carries the $db argument"
+    );
+    write_frame(&mut stream, request_id, &reply).await;
+}
+
+#[tokio::test]
+async fn delete_removes_every_match_and_says_so() {
+    let expected_filter = vec![("n".to_owned(), int32(3))];
+    let (port, server) =
+        spawn_server(move |stream| delete_server(stream, expected_filter, delete_reply(2)));
+    let source = source_for(port).await;
+
+    // The delete travels ONLY behind the confirmed seam.
+    let typed = source
+        .execute_statement_typed_confirmed("delete components with n = 3", &[])
+        .await
+        .expect("the confirmed execution runs the delete");
+    assert!(typed.columns.is_empty(), "a delete yields no columns");
+    assert!(typed.rows.is_empty(), "a delete yields no rows");
+    assert_eq!(typed.command_tag, Some("delete 2".to_owned()));
+    assert_eq!(typed.affected_rows, Some(2));
+    assert_eq!(
+        typed.message,
+        Some("delete components: 2 document(s) removed".to_owned()),
+        "the acceptance names what was wiped in words"
+    );
+
+    server.await.expect("server task");
+}
+
+#[tokio::test]
+async fn the_unconfirmed_delete_refuses_and_the_connection_survives() {
+    let expected_filter = vec![("n".to_owned(), int32(1))];
+    let (port, server) =
+        spawn_server(move |stream| delete_server(stream, expected_filter, delete_reply(1)));
+    let source = source_for(port).await;
+
+    // The ordinary typed surface refuses BEFORE any wire bytes: the
+    // refusals must name the confirmed seam (DBeaver destructive-SQL
+    // confirmation analog). The same connection then executes the
+    // confirmed delete fine — a refusal is stateless client-side.
+    let error = source
+        .execute_statement_typed("delete components with n = 1", &[])
+        .await
+        .expect_err("the ordinary typed surface refuses a delete");
+    assert!(
+        protocol_error(error, "delete statements are destructive"),
+        "the refusal names the destructiveness, got nothing"
+    );
+    let error = source
+        .execute_statement_typed("delete components with n = 1", &[])
+        .await
+        .expect_err("the ordinary typed surface refuses a delete");
+    assert!(
+        protocol_error(error, "execute_statement_typed_confirmed"),
+        "the refusal names the seam, got nothing"
+    );
+
+    let typed = source
+        .execute_statement_typed_confirmed("delete components with n = 1", &[])
+        .await
+        .expect("the confirmed seam runs the delete on a fresh state");
+    assert_eq!(typed.command_tag, Some("delete 1".to_owned()));
+    assert_eq!(
+        typed.message,
+        Some("delete components: 1 document(s) removed".to_owned())
+    );
+
+    server.await.expect("server task");
+}
+
+#[tokio::test]
+async fn delete_shapes_beyond_the_wire_never_reach_it() {
+    let (port, server) = spawn_server(handshake_only_server);
+    let source = source_for(port).await;
+
+    // A filter-less delete would match everything: that shape is not a
+    // statement at all, minting the form hint before any frame exists.
+    let error = source
+        .execute_statement_typed("delete components", &[])
+        .await
+        .expect_err("a filter-less delete is not a statement");
+    assert!(
+        protocol_error(
+            error,
+            "delete statements are 'delete <collection> with <filter>'"
+        ),
+        "the form hint names the required filter"
+    );
+
+    // Wrong arity: the compiled filter has a `?` to bind. A delete's
+    // low-level failures surface through the confirmed seam (the
+    // ordinary surface answers the seam refusal, always).
+    let error = source
+        .execute_statement_typed_confirmed("delete components with n = ?", &[])
+        .await
+        .expect_err("missing parameter");
+    assert!(
+        protocol_error(error, "statement expects 1 parameter(s), got 0"),
+        "the compiled filter binds before anything is sent"
+    );
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn a_bound_delete_filters_with_the_parameter() {
+    let expected_filter = vec![("n".to_owned(), Bson::Int64(4))];
+    let (port, server) =
+        spawn_server(move |stream| delete_server(stream, expected_filter, delete_reply(0)));
+    let source = source_for(port).await;
+
+    let typed = source
+        .execute_statement_typed_confirmed(
+            "delete components with n = ?",
+            &[QueryParameter::Integer(4)],
+        )
+        .await
+        .expect("the bound delete executes");
+    assert_eq!(typed.command_tag, Some("delete 0".to_owned()));
+    assert_eq!(
+        typed.message,
+        Some("delete components: 0 document(s) removed".to_owned()),
+        "a zero-delete is still an explicit, visible acceptance"
+    );
+
+    server.await.expect("server task");
+}
+
+#[tokio::test]
+async fn update_applies_the_update_spec_and_says_what_it_touched() {
+    let expected_filter = vec![("n".to_owned(), int32(2))];
+    let expected_update = vec![(
+        "$set".to_owned(),
+        Bson::Document(vec![("flag".to_owned(), int32(1))]),
+    )];
+    let (port, server) = spawn_server(move |stream| {
+        update_server(stream, expected_filter, expected_update, update_reply(1, 1))
+    });
+    let source = source_for(port).await;
+
+    // The update executes from the ORDINARY path (the confirmation seam
+    // is scoped to delete): matched and modified arrive separately, in
+    // words and in the tag/count contract.
+    let typed = source
+        .execute_statement_typed(
+            r#"update components with n = 2 set {"$set": {"flag": 1}}"#,
+            &[],
+        )
+        .await
+        .expect("the update executes");
+    assert!(typed.columns.is_empty(), "an update yields no columns");
+    assert!(typed.rows.is_empty(), "an update yields no rows");
+    assert_eq!(typed.command_tag, Some("update 1".to_owned()));
+    assert_eq!(typed.affected_rows, Some(1));
+    assert_eq!(
+        typed.message,
+        Some("update components: 1 matched, 1 modified".to_owned())
+    );
+
+    server.await.expect("server task");
+}
+
+#[tokio::test]
+async fn the_set_separator_never_splits_quoted_filter_values() {
+    // Three server cases in a row: single-quoted 'my set version',
+    // double-quoted "my set", and the doubled-quote escape 'a''set''b'.
+    let cases: Vec<(&str, Document)> = vec![
+        (
+            r#"update components with tag = 'my set version' set {"$set": {"a": 1}}"#,
+            vec![("tag".to_owned(), Bson::String("my set version".to_owned()))],
+        ),
+        (
+            r#"update components with tag = "my set" set {"$set": {"a": 1}}"#,
+            vec![("tag".to_owned(), Bson::String("my set".to_owned()))],
+        ),
+        (
+            r#"update components with sig = 'a''set''b' set {"$set": {"a": 1}}"#,
+            vec![("sig".to_owned(), Bson::String("a'set'b".to_owned()))],
+        ),
+    ];
+    for (sql, expected_filter) in cases {
+        let expected_update = vec![(
+            "$set".to_owned(),
+            Bson::Document(vec![("a".to_owned(), int32(1))]),
+        )];
+        let (port, server) = spawn_server(move |stream| {
+            update_server(stream, expected_filter, expected_update, update_reply(1, 1))
+        });
+        let source = source_for(port).await;
+        let typed = source
+            .execute_statement_typed(sql, &[])
+            .await
+            .expect("the quoted 'set' stays part of the filter");
+        assert_eq!(typed.command_tag, Some("update 1".to_owned()));
+        server.await.expect("server task");
+    }
+}
+
+#[tokio::test]
+async fn a_bound_update_filters_with_the_parameter() {
+    let expected_filter = vec![("n".to_owned(), Bson::Int64(2))];
+    let expected_update = vec![(
+        "$set".to_owned(),
+        Bson::Document(vec![("flag".to_owned(), int32(1))]),
+    )];
+    let (port, server) = spawn_server(move |stream| {
+        update_server(stream, expected_filter, expected_update, update_reply(2, 2))
+    });
+    let source = source_for(port).await;
+
+    let typed = source
+        .execute_statement_typed(
+            r#"update components with n = ? set {"$set": {"flag": 1}}"#,
+            &[QueryParameter::Integer(2)],
+        )
+        .await
+        .expect("the bound update executes");
+    assert_eq!(
+        typed.message,
+        Some("update components: 2 matched, 2 modified".to_owned())
+    );
+
+    server.await.expect("server task");
+}
+
+#[tokio::test]
+async fn update_failures_never_reach_the_wire() {
+    let (port, server) = spawn_server(handshake_only_server);
+    let source = source_for(port).await;
+
+    // No `set` clause: the form hint, client-side.
+    let error = source
+        .execute_statement_typed("update components with n = 2", &[])
+        .await
+        .expect_err("an update without its set document is not a statement");
+    assert!(protocol_error(
+        error,
+        "update statements are 'update <collection> with <filter> set <document>'"
+    ));
+
+    // Malformed JSON after the real `set` separator.
+    let error = source
+        .execute_statement_typed("update components with n = 2 set {not json}", &[])
+        .await
+        .expect_err("malformed update document");
+    assert!(protocol_error(error, "mongo update document"));
+
+    // A top-level array payload: the update spec is one object.
+    let error = source
+        .execute_statement_typed(
+            r#"update components with n = 2 set [{"$set": {"a": 1}}]"#,
+            &[],
+        )
+        .await
+        .expect_err("a top-level array is not an update spec");
+    assert!(protocol_error(error, "expected a JSON object"));
+
+    // Wrong arity: the compiled filter has a `?` to bind.
+    let error = source
+        .execute_statement_typed(
+            r#"update components with n = ? set {"$set": {"a": 1}}"#,
+            &[],
+        )
+        .await
+        .expect_err("missing parameter");
+    assert!(protocol_error(
+        error,
+        "statement expects 1 parameter(s), got 0"
+    ));
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn update_write_errors_stay_errors() {
+    let write_error: Document = vec![
+        ("index".to_owned(), int32(0)),
+        ("code".to_owned(), int32(11000)),
+        (
+            "errmsg".to_owned(),
+            Bson::String("E11000 duplicate key error collection: admin.components".to_owned()),
+        ),
+    ];
+    let reply = Document::from(vec![
+        ("ok".to_owned(), int32(1)),
+        ("n".to_owned(), int32(0)),
+        ("nModified".to_owned(), int32(0)),
+        (
+            "writeErrors".to_owned(),
+            Bson::Array(vec![Bson::Document(write_error)]),
+        ),
+    ]);
+    let expected_filter = vec![("n".to_owned(), int32(2))];
+    let expected_update = vec![(
+        "$set".to_owned(),
+        Bson::Document(vec![("flag".to_owned(), int32(1))]),
+    )];
+    let (port, server) =
+        spawn_server(move |stream| update_server(stream, expected_filter, expected_update, reply));
+    let source = source_for(port).await;
+
+    let error = source
+        .execute_statement_typed(
+            r#"update components with n = 2 set {"$set": {"flag": 1}}"#,
+            &[],
+        )
+        .await
+        .expect_err("a write error must not read as a successful update");
+    assert!(
+        matches!(
+            &error,
+            ConnectionError::ExecutionFailed { message, .. } if message.contains("E11000")
+        ),
+        "the server's write errmsg surfaces, got {error:?}"
+    );
+
+    server.await.expect("server task");
+}
+
+#[tokio::test]
+async fn an_update_reply_without_its_modified_count_is_a_protocol_error() {
+    let reply = Document::from(vec![
+        ("ok".to_owned(), int32(1)),
+        ("n".to_owned(), int32(1)),
+    ]);
+    let expected_filter = vec![("n".to_owned(), int32(2))];
+    let expected_update = vec![(
+        "$set".to_owned(),
+        Bson::Document(vec![("flag".to_owned(), int32(1))]),
+    )];
+    let (port, server) =
+        spawn_server(move |stream| update_server(stream, expected_filter, expected_update, reply));
+    let source = source_for(port).await;
+
+    let error = source
+        .execute_statement_typed(
+            r#"update components with n = 2 set {"$set": {"flag": 1}}"#,
+            &[],
+        )
+        .await
+        .expect_err("a missing nModified cannot read as a silent zero");
+    assert!(
+        protocol_error(error, "the update reply carries no 'nModified' count"),
+        "the count context names the update command"
+    );
+
+    server.await.expect("server task");
+}
+
+#[tokio::test]
+async fn a_delete_reply_without_its_count_is_a_protocol_error() {
+    let reply = Document::from(vec![("ok".to_owned(), int32(1))]);
+    let expected_filter = vec![("n".to_owned(), int32(2))];
+    let (port, server) = spawn_server(move |stream| delete_server(stream, expected_filter, reply));
+    let source = source_for(port).await;
+
+    let error = source
+        .execute_statement_typed_confirmed("delete components with n = 2", &[])
+        .await
+        .expect_err("a missing count cannot read as a silent removal");
+    assert!(
+        protocol_error(error, "the delete reply carries no 'n' count"),
+        "the count context names the delete command"
+    );
+
+    server.await.expect("server task");
+}
+
+#[tokio::test]
+async fn paging_rejects_delete_and_update_statements() {
+    let (port, server) = spawn_server(handshake_only_server);
+    let source = source_for(port).await;
+
+    let error = source
+        .query_page_start("delete components with n = 2", &[], 10)
+        .await
+        .expect_err("a delete has no cursor to page");
+    assert!(
+        protocol_error(error, "cursor paging requires a find statement"),
+        "paging must reject the statement client-side"
+    );
+
+    let error = source
+        .query_page_start(
+            r#"update components with n = 2 set {"$set": {"a": 1}}"#,
+            &[],
+            10,
+        )
+        .await
+        .expect_err("an update has no cursor to page");
+    assert!(
+        protocol_error(error, "cursor paging requires a find statement"),
+        "paging must reject the statement client-side"
     );
 
     drop(server);

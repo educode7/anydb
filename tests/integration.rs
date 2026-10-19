@@ -321,6 +321,7 @@ impl DataSource for CachedEchoSource {
             rows: vec![vec![Some(TypedValue::Int8(9))]],
             command_tag: Some("SELECT 1".into()),
             affected_rows: Some(1),
+            message: None,
         })
     }
 
@@ -486,6 +487,52 @@ async fn drivers_without_transaction_semantics_refuse_by_default() {
     }
 }
 
+/// Data source with a sentinel typed execution: its confirmed seam is
+/// the trait default, so the delegation is observable through the
+/// sentinel.
+struct SeamEchoSource;
+
+#[async_trait::async_trait]
+impl DataSource for SeamEchoSource {
+    fn metadata(&self) -> DataSourceMetadata {
+        DataSourceMetadata {
+            product_name: "Fake".into(),
+            product_version: "0".into(),
+            driver_name: "fake-seam".into(),
+        }
+    }
+
+    async fn ping(&self) -> ConnectionResult<()> {
+        Ok(())
+    }
+
+    async fn execute_statement_typed(
+        &self,
+        _sql: &str,
+        _params: &[QueryParameter],
+    ) -> ConnectionResult<TypedStatementResult> {
+        Ok(TypedStatementResult {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            command_tag: Some("DEMO 1".into()),
+            affected_rows: Some(1),
+            message: None,
+        })
+    }
+
+    async fn close(&self) {}
+}
+
+#[tokio::test]
+async fn the_confirmed_seam_defaults_to_the_ordinary_typed_path() {
+    let source: Arc<dyn DataSource> = Arc::new(SeamEchoSource);
+    let result = source
+        .execute_statement_typed_confirmed("demo 1", &[])
+        .await
+        .expect("default seam delegates to the driver's typed execution");
+    assert_eq!(result.command_tag.as_deref(), Some("DEMO 1"));
+}
+
 // ---------- typed statement execution through the pipeline ----------
 
 /// Data source with a typed catalog behavior: the first typed execution
@@ -531,6 +578,7 @@ impl DataSource for TypedEchoSource {
             rows: vec![vec![Some(TypedValue::Int8(7))]],
             command_tag: Some("SELECT 1".into()),
             affected_rows: Some(1),
+            message: None,
         })
     }
 

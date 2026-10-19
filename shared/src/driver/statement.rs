@@ -39,6 +39,11 @@ pub struct StatementResult {
     /// Trailing batch count of the tag when it is a plain number
     /// (`UPDATE 3` -> 3, `INSERT 0 1` -> 1, `BEGIN` -> None).
     pub affected_rows: Option<i64>,
+    /// Human-legible write acceptance beyond the tag ("delete coll: 1
+    /// document(s) removed"): destructive statements report what they did
+    /// in words, so no caller has to re-parse tags to answer "what got
+    /// wiped?" (the mongo delete/update vertical; `None` elsewhere).
+    pub message: Option<String>,
 }
 
 /// Result of one prepared-statement execution with typed values applied by
@@ -54,6 +59,10 @@ pub struct TypedStatementResult {
     /// Trailing batch count of the tag when it is a plain number
     /// (`UPDATE 3` -> 3, `INSERT 0 1` -> 1, `BEGIN` -> None).
     pub affected_rows: Option<i64>,
+    /// Human-legible write acceptance ("delete coll: 1 document(s)
+    /// removed", "update coll: 3 matched, 3 modified"); `None` for the
+    /// statement forms that answer through their tag alone.
+    pub message: Option<String>,
 }
 
 /// A typed result value produced by a driver's binary / text type catalog

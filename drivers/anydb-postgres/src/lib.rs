@@ -218,6 +218,9 @@ fn statement_result(
         rows: result.rows,
         command_tag: result.command_tag,
         affected_rows: result.affected_rows,
+        // The postgres surface answers through its `CommandComplete`
+        // tag (`DELETE 2`); no separate acceptance message today.
+        message: None,
     }
 }
 
@@ -278,6 +281,9 @@ fn typed_statement_result(typed: protocol::TypedResult) -> TypedStatementResult 
         rows: typed.rows,
         command_tag: typed.command_tag,
         affected_rows: typed.affected_rows,
+        // The postgres surface answers through its `CommandComplete`
+        // tag (`DELETE 2`); no separate acceptance message today.
+        message: None,
     }
 }
 

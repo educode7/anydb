@@ -89,6 +89,20 @@ pub trait DataSource: Send + Sync {
         self.execute_statement_typed(sql, params).await
     }
 
+    /// Destructive-statement execution seam (DBeaver's "confirm before
+    /// executing destructive SQL" analog): a driver whose statement
+    /// surface routes destructive statements behind an explicit
+    /// caller-side acceptance keeps them reachable ONLY here. Default:
+    /// plain typed execution — drivers without destructive statements
+    /// degrade gracefully, mirroring the transaction-control trio.
+    async fn execute_statement_typed_confirmed(
+        &self,
+        sql: &str,
+        params: &[QueryParameter],
+    ) -> Result<TypedStatementResult, ConnectionError> {
+        DataSource::execute_statement_typed(self, sql, params).await
+    }
+
     /// Starts an explicit transaction over the live context (JDBC
     /// `setAutoCommit(false)` analog: DBeaver drives `BEGIN`-shaped
     /// control through the session before grouped statements). Default:
