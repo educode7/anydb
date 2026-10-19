@@ -251,12 +251,16 @@ fn match_op(op: &str, value: Option<&Bson>, operand: &Bson) -> bool {
 }
 
 /// Mongo numeric equality ignores int widths and int/double; strings,
-/// booleans and null compare by category.
+/// booleans and null compare by category; decimal equality is
+/// representational in the fake (both sides arrive from the same
+/// parse) — the real mongod compares decimals numerically across
+/// encodings, which the live smoke adjudicates.
 fn values_equal(a: &Bson, b: &Bson) -> bool {
     if let (Some(x), Some(y)) = (as_number(a), as_number(b)) {
         return x == y;
     }
     match (a, b) {
+        (Bson::Decimal128(x), Bson::Decimal128(y)) => x == y,
         (Bson::String(x), Bson::String(y)) => x == y,
         (Bson::Boolean(x), Bson::Boolean(y)) => x == y,
         (Bson::Null, Bson::Null) => true,
@@ -293,6 +297,10 @@ fn doc_n(n: i32, tag: &str, flag: bool) -> Document {
         ("tag".to_owned(), Bson::String(tag.to_owned())),
         ("flag".to_owned(), Bson::Boolean(flag)),
     ])
+}
+
+fn doc_v(n: i32, v: Bson) -> Document {
+    Document::from(vec![("n".to_owned(), int32(n)), ("v".to_owned(), v)])
 }
 
 fn doc_txt(n: i32, txt: &str) -> Document {
@@ -777,6 +785,45 @@ async fn paged_find_carries_the_filter_and_get_more_does_not() {
         "the drained batch carries the accumulated total"
     );
     assert_eq!(last.result.affected_rows, Some(3));
+
+    server.await.expect("server task");
+}
+
+#[tokio::test]
+async fn decimal_params_filter_exact_decimal_values() {
+    use anydb_mongo::bson::parse_decimal128;
+
+    let decimal = |text: &str| Bson::Decimal128(parse_decimal128(text).expect("decimal literal"));
+    let dataset = vec![
+        doc_v(1, decimal("123.456")),
+        doc_v(2, decimal("2.50")),
+        doc_v(3, Bson::Double(123.456)),
+    ];
+    let (port, server) = spawn_server(move |stream| {
+        filter_find_server(
+            stream,
+            Bson::Document(vec![("v".to_owned(), decimal("123.456"))]),
+            dataset,
+            1,
+        )
+    });
+    let source = source_for(port).await;
+
+    // The bind side runs the same parse the decode side produced
+    // TypedValue::BigDecimal from: equality is exact, the binary double
+    // approximation cannot confuse the decimal match.
+    let typed = source
+        .execute_statement_typed(
+            "find c1 with v = ?",
+            &[QueryParameter::BigDecimal("123.456".to_owned())],
+        )
+        .await
+        .expect("typed execution");
+    assert_eq!(typed.rows.len(), 1);
+    match &typed.rows[0][1] {
+        Some(TypedValue::BigDecimal(text)) => assert_eq!(text, "123.456"),
+        other => panic!("unexpected value {other:?}"),
+    }
 
     server.await.expect("server task");
 }

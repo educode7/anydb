@@ -1,4 +1,4 @@
-//! Smoke demo against a REAL mongod — `cargo run -p anydb-mongo --example smoke`.
+//! Smoke demo against a REAL mongod â€” `cargo run -p anydb-mongo --example smoke`.
 //!
 //! Accepts either target form the platform contract supports:
 //!   * full connection string: `mongodb://localhost:27017/vuce-landingz`
@@ -105,6 +105,63 @@ async fn main() {
     print_result(
         &negated_slot,
         "find anydb_smoke with flag = true and not tag = 'a'",
+    );
+
+    // 2d) BigDecimal binds: exact decimal equality (doc 7 carries
+    // `NumberDecimal('123.456')`), cross-width equality of an exact
+    // decimal against an int field, and the double-vs-decimal probe
+    // whose outcome the real mongod adjudicates (printed as evidence).
+    let decimal_eq = source
+        .execute_statement_typed(
+            "find anydb_smoke with price = ?",
+            &[anydb_shared::driver::statement::QueryParameter::BigDecimal(
+                "123.456".to_owned(),
+            )],
+        )
+        .await
+        .expect("decimal-equality find");
+    print_result(
+        &decimal_eq,
+        "find anydb_smoke with price = ? (BigDecimal 123.456)",
+    );
+    assert_eq!(decimal_eq.rows.len(), 1, "the exact decimal matches doc 7");
+
+    let decimal_int = source
+        .execute_statement_typed(
+            "find anydb_smoke with n = ?",
+            &[anydb_shared::driver::statement::QueryParameter::BigDecimal(
+                "8".to_owned(),
+            )],
+        )
+        .await
+        .expect("decimal-vs-int find");
+    print_result(&decimal_int, "find anydb_smoke with n = ? (BigDecimal 8)");
+    assert_eq!(
+        decimal_int.rows.len(),
+        1,
+        "the real mongod compares an exact decimal against int fields numerically"
+    );
+
+    // Live-adjudicated rule: the binary double 123.456 (inexact) does
+    // NOT match `NumberDecimal('123.456')` — exact decimal comparison
+    // keeps BigDecimal and Float distinguishable server-side.
+    let double_probe = source
+        .execute_statement_typed(
+            "find anydb_smoke with price = ?",
+            &[anydb_shared::driver::statement::QueryParameter::Float(
+                123.456,
+            )],
+        )
+        .await
+        .expect("double-vs-decimal find");
+    print_result(
+        &double_probe,
+        "find anydb_smoke with price = ? (Double 123.456 - must not match)",
+    );
+    assert_eq!(
+        double_probe.rows.len(),
+        0,
+        "a double cannot confuse an exact decimal value"
     );
 
     // 3) Cursor paging: batches of two while the cursor id stays open.

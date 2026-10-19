@@ -34,8 +34,9 @@
 //! first-seen order across all branches): `Integer` maps to `Int64`
 //! (mongo compares numerically across widths), `Float` to `Double`,
 //! `Text` to `String`, `Binary` to `Binary`, `Boolean` to `Boolean`,
-//! `Null` to `null`. A literal `?` character cannot exist unquoted in
-//! filter text.
+//! `Null` to `null`, and `BigDecimal` parses to exact BSON
+//! `decimal128` (invalid decimal text is a bind-time protocol error).
+//! A literal `?` character cannot exist unquoted in filter text.
 //!
 //! Compiling: a conjunctive run of predicates on the same path merges
 //! into ONE operator document (`n > 1 and n < 5` becomes
@@ -470,13 +471,18 @@ fn bind_value(value: &Value, params: &[QueryParameter]) -> Result<Bson, Connecti
             let parameter = params
                 .get(*index)
                 .ok_or_else(|| protocol(format!("missing parameter #{}", index + 1)))?;
-            Ok(bson_value(parameter))
+            bson_value(parameter)
         }
     }
 }
 
-fn bson_value(parameter: &QueryParameter) -> Bson {
-    match parameter {
+/// Maps one SPI parameter to its BSON value. Mongo compares numbers
+/// numerically across int widths, so the SPI's widest-integer rule
+/// lands on `Int64`; `BigDecimal` parses to exact BSON `decimal128`
+/// (invalid decimal text is a named bind error, checked before any
+/// wire round-trip).
+fn bson_value(parameter: &QueryParameter) -> Result<Bson, ConnectionError> {
+    Ok(match parameter {
         QueryParameter::Null => Bson::Null,
         QueryParameter::Boolean(value) => Bson::Boolean(*value),
         // Mongo compares numerically across int widths, so the SPI's
@@ -485,7 +491,13 @@ fn bson_value(parameter: &QueryParameter) -> Bson {
         QueryParameter::Float(value) => Bson::Double(*value),
         QueryParameter::Text(value) => Bson::String(value.clone()),
         QueryParameter::Binary(value) => Bson::Binary(value.clone()),
-    }
+        // The decode side of `decimal128` (BSON type 0x13) produced
+        // `TypedValue::BigDecimal`; the bind side runs the same
+        // parse in reverse, so the filter docs and stored documents
+        // share one encoding. `Float` stays `Double` (binary float);
+        // exact decimal comparisons need this variant.
+        QueryParameter::BigDecimal(text) => Bson::Decimal128(crate::bson::parse_decimal128(text)?),
+    })
 }
 
 // ---------- parser ----------
@@ -985,6 +997,47 @@ mod tests {
             .expect("parse")
             .document(params)
             .expect("bind")
+    }
+
+    #[test]
+    fn big_decimal_binds_to_exact_decimal128() {
+        // The bind side of `decimal128` runs the same parse the decode
+        // side produced `TypedValue::BigDecimal` from, so filter docs
+        // and stored documents share one encoding.
+        assert_eq!(
+            bind("v = ?", &[QueryParameter::BigDecimal("123.456".to_owned())]),
+            vec![(
+                "v".to_owned(),
+                Bson::Decimal128(crate::bson::parse_decimal128("123.456").expect("literal"))
+            )]
+        );
+        // Trailing-zero scale is carried (exactness is the point).
+        assert_eq!(
+            bind(
+                "v = ? and w = ?",
+                &[
+                    QueryParameter::BigDecimal("1.50".to_owned()),
+                    QueryParameter::BigDecimal("-0.0".to_owned()),
+                ]
+            ),
+            vec![
+                (
+                    "v".to_owned(),
+                    Bson::Decimal128(crate::bson::parse_decimal128("1.50").expect("literal"))
+                ),
+                (
+                    "w".to_owned(),
+                    Bson::Decimal128(crate::bson::parse_decimal128("-0.0").expect("literal"))
+                ),
+            ]
+        );
+        // Invalid decimal text is a named bind-time protocol error,
+        // checked BEFORE any wire round-trip.
+        let filter = parse_filter("v = ?").expect("parses");
+        assert!(matches!(
+            filter.document(&[QueryParameter::BigDecimal("oops".to_owned())]),
+            Err(ConnectionError::Protocol(ref message)) if message.contains("invalid decimal128 literal")
+        ));
     }
 
     fn error(text: &str) -> String {

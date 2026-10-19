@@ -19,6 +19,12 @@ pub enum QueryParameter {
     Text(String),
     /// Opaque driver-native bytes (Postgres: `bytea`).
     Binary(Vec<u8>),
+    /// Arbitrary-precision decimal carried as canonical decimal TEXT
+    /// (the DBeaver `BigDecimal` bind analog): mongo binds it to BSON
+    /// `decimal128` (exact decimal comparison server-side), Postgres to
+    /// `numeric`. Invalid decimal text fails at bind time, before any
+    /// wire round-trip.
+    BigDecimal(String),
 }
 
 /// Result of one prepared-statement execution. Values are text-format

@@ -27,7 +27,7 @@ use anydb_shared::driver::statement::TypedValue;
 /// Bind request section shared by both extended flows: parameter format
 /// list (every parameter binary), values with their lengths (`-1` never
 /// sends value bytes), minus portal/statement names and result formats.
-fn bind_param_section(params: &[QueryParameter]) -> Vec<u8> {
+fn bind_param_section(params: &[QueryParameter]) -> Result<Vec<u8>, ConnectionError> {
     let mut payload = Vec::new();
     payload.extend_from_slice(&(params.len() as i16).to_be_bytes());
     for _ in params {
@@ -35,7 +35,7 @@ fn bind_param_section(params: &[QueryParameter]) -> Vec<u8> {
     }
     payload.extend_from_slice(&(params.len() as i16).to_be_bytes());
     for param in params {
-        match param_binary(param) {
+        match param_binary(param)? {
             Some(bytes) => {
                 payload.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
                 payload.extend(bytes);
@@ -43,21 +43,25 @@ fn bind_param_section(params: &[QueryParameter]) -> Vec<u8> {
             None => payload.extend_from_slice(&(-1i32).to_be_bytes()),
         }
     }
-    payload
+    Ok(payload)
 }
 
 /// `Parse` payload for one prepared statement (named or unnamed): sql plus
 /// declared parameter type OIDs.
-fn parse_message_payload(name: &str, sql: &str, params: &[QueryParameter]) -> Vec<u8> {
+fn parse_message_payload(
+    name: &str,
+    sql: &str,
+    params: &[QueryParameter],
+) -> Result<Vec<u8>, ConnectionError> {
     let mut parse_payload = name.as_bytes().to_vec();
     parse_payload.push(0);
     parse_payload.extend_from_slice(sql.as_bytes());
     parse_payload.push(0);
     parse_payload.extend_from_slice(&(params.len() as i16).to_be_bytes());
     for param in params {
-        parse_payload.extend_from_slice(&param_type_oid(param).to_be_bytes());
+        parse_payload.extend_from_slice(&param_type_oid(param)?.to_be_bytes());
     }
-    parse_payload
+    Ok(parse_payload)
 }
 
 /// `Bind` payload: portal and statement names, binary-format parameter
@@ -69,17 +73,17 @@ fn bind_message_payload(
     statement: &str,
     params: &[QueryParameter],
     result_formats: &[i16],
-) -> Vec<u8> {
+) -> Result<Vec<u8>, ConnectionError> {
     let mut payload = portal.as_bytes().to_vec();
     payload.push(0);
     payload.extend_from_slice(statement.as_bytes());
     payload.push(0);
-    payload.extend(bind_param_section(params));
+    payload.extend(bind_param_section(params)?);
     payload.extend_from_slice(&(result_formats.len() as i16).to_be_bytes());
     for format in result_formats {
         payload.extend_from_slice(&(*format).to_be_bytes());
     }
-    payload
+    Ok(payload)
 }
 
 use crate::auth::{self, ScramClient};
@@ -95,28 +99,37 @@ const OID_FLOAT8: i32 = 701;
 
 /// Declared type OID for one SPI parameter (`0` = unknown: only NULL uses
 /// this, letting the server infer the type from the statement context).
-fn param_type_oid(param: &QueryParameter) -> i32 {
+/// `BigDecimal` is refused: exact decimal binding to postgres `numeric`
+/// (the base-10000 binary encode) is not wired in this driver yet, and
+/// the refusal is named instead of an accidental text coercion.
+fn param_type_oid(param: &QueryParameter) -> Result<i32, ConnectionError> {
     match param {
-        QueryParameter::Null => 0,
-        QueryParameter::Boolean(_) => OID_BOOL,
-        QueryParameter::Integer(_) => OID_INT8,
-        QueryParameter::Float(_) => OID_FLOAT8,
-        QueryParameter::Text(_) => OID_TEXT,
-        QueryParameter::Binary(_) => OID_BYTEA,
+        QueryParameter::Null => Ok(0),
+        QueryParameter::Boolean(_) => Ok(OID_BOOL),
+        QueryParameter::Integer(_) => Ok(OID_INT8),
+        QueryParameter::Float(_) => Ok(OID_FLOAT8),
+        QueryParameter::Text(_) => Ok(OID_TEXT),
+        QueryParameter::Binary(_) => Ok(OID_BYTEA),
+        QueryParameter::BigDecimal(_) => Err(ConnectionError::Protocol(
+            "binding 'BigDecimal' parameters is refused on this driver yet".to_owned(),
+        )),
     }
 }
 
 /// Binary-format (1) value bytes; `None` for NULL (negative length on the
 /// wire). `Text` and `Binary` share the same length-prefixed layout, so the
 /// byte form is identical for both formats.
-fn param_binary(param: &QueryParameter) -> Option<Vec<u8>> {
+fn param_binary(param: &QueryParameter) -> Result<Option<Vec<u8>>, ConnectionError> {
     match param {
-        QueryParameter::Null => None,
-        QueryParameter::Boolean(value) => Some(vec![u8::from(*value)]),
-        QueryParameter::Integer(value) => Some(value.to_be_bytes().to_vec()),
-        QueryParameter::Float(value) => Some(value.to_be_bytes().to_vec()),
-        QueryParameter::Text(value) => Some(value.clone().into_bytes()),
-        QueryParameter::Binary(value) => Some(value.clone()),
+        QueryParameter::Null => Ok(None),
+        QueryParameter::Boolean(value) => Ok(Some(vec![u8::from(*value)])),
+        QueryParameter::Integer(value) => Ok(Some(value.to_be_bytes().to_vec())),
+        QueryParameter::Float(value) => Ok(Some(value.to_be_bytes().to_vec())),
+        QueryParameter::Text(value) => Ok(Some(value.clone().into_bytes())),
+        QueryParameter::Binary(value) => Ok(Some(value.clone())),
+        QueryParameter::BigDecimal(_) => Err(ConnectionError::Protocol(
+            "binding 'BigDecimal' parameters is refused on this driver yet".to_owned(),
+        )),
     }
 }
 
@@ -1052,7 +1065,7 @@ impl Connection {
         write_message(
             &mut self.stream,
             b'P',
-            &parse_message_payload("", sql, params),
+            &parse_message_payload("", sql, params)?,
         )
         .await?;
 
@@ -1061,7 +1074,7 @@ impl Connection {
         write_message(
             &mut self.stream,
             b'B',
-            &bind_message_payload("", "", params, &[0]),
+            &bind_message_payload("", "", params, &[0])?,
         )
         .await?;
 
@@ -1149,7 +1162,7 @@ impl Connection {
         write_message(
             &mut self.stream,
             b'P',
-            &parse_message_payload("", sql, params),
+            &parse_message_payload("", sql, params)?,
         )
         .await?;
         write_message(&mut self.stream, b'D', b"S\0").await?;
@@ -1218,7 +1231,7 @@ impl Connection {
         write_message(
             &mut self.stream,
             b'B',
-            &bind_message_payload("", "", params, &formats),
+            &bind_message_payload("", "", params, &formats)?,
         )
         .await?;
 
@@ -1287,7 +1300,7 @@ impl Connection {
         write_message(
             &mut self.stream,
             b'P',
-            &parse_message_payload(name, sql, &[]),
+            &parse_message_payload(name, sql, &[])?,
         )
         .await?;
         let mut describe_payload = name.as_bytes().to_vec();
@@ -1366,7 +1379,7 @@ impl Connection {
         write_message(
             &mut self.stream,
             b'B',
-            &bind_message_payload("", &prepared.name, params, &prepared.result_formats),
+            &bind_message_payload("", &prepared.name, params, &prepared.result_formats)?,
         )
         .await?;
 
@@ -1497,7 +1510,7 @@ impl Connection {
         write_message(
             &mut self.stream,
             b'P',
-            &parse_message_payload("", sql, params),
+            &parse_message_payload("", sql, params)?,
         )
         .await?;
         write_message(&mut self.stream, b'D', b"S\0").await?;
@@ -1624,7 +1637,7 @@ impl Connection {
         write_message(
             &mut self.stream,
             b'B',
-            &bind_message_payload("", "", params, &formats),
+            &bind_message_payload("", "", params, &formats)?,
         )
         .await?;
         let mut execute_payload = vec![0u8];
@@ -1721,6 +1734,18 @@ impl Connection {
 #[cfg(test)]
 mod statement_cache_tests {
     use super::*;
+
+    #[test]
+    fn big_decimal_binding_is_a_named_refusal() {
+        use anydb_shared::driver::statement::QueryParameter;
+        let refused = param_type_oid(&QueryParameter::BigDecimal("1.5".to_owned()));
+        assert!(matches!(
+            refused,
+            Err(ConnectionError::Protocol(ref message)) if message.contains("refused")
+        ));
+        let bytes = param_binary(&QueryParameter::BigDecimal("1.5".to_owned()));
+        assert!(bytes.is_err(), "no silent text coercion");
+    }
 
     fn prepared(sql: &str) -> Prepared {
         Prepared {
