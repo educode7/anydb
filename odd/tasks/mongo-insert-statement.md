@@ -159,10 +159,25 @@ The consumer (`auth-landing-componentes-api`) reads with `findByIsActiveEquals("
   `1fc6a34` was verified in isolation (everything else stashed, then `cargo test -p anydb-mongo`:
   64 lib + 31 integration tests, exit 0); from `9d80eb1` on, `src/` and `tests/` are byte-identical
   to the state the workspace gates ran green on. Working tree clean at `06d52b8`.
-- L11 (2026-10-19, open): `main` advanced past the branch cut point (`bd7fa20`) with `36cb935`
-  (SPI transaction control) and `bd7fa20` (README + LICENSE). `36cb935` touches
+- L11 (2026-10-19, open → resolved in L12): `main` advanced past the branch cut point (`bd7fa20`)
+  with `36cb935` (SPI transaction control) and `bd7fa20` (README + LICENSE). `36cb935` touches
   `drivers/anydb-mongo/src/lib.rs` with a 3-line module-doc addition at the SAME anchor where this
   feature inserted its doc paragraph, so `git merge-tree` reports "changed in both": a rebase would
   hit a trivial doc-comment conflict (main's added lines are a note that ACID transactions are not
-  wired for mongo; this feature's are the `insert` statement paragraph — both belong). The branch is
-  NOT rebased or merged; the hashes above stand until the user decides.
+  wired for mongo; this feature's are the `insert` statement paragraph — both belong).
+- L12 (2026-10-19, delivery): user asked verbatim "corregir el punto 1, hacer merge a main y push
+  pero que no se pierda nada". Done by MERGE, not rebase, so every hash in L10 still stands.
+  - `547267e` merge main into the mongo insert feature branch — the single conflict in
+    `drivers/anydb-mongo/src/lib.rs` resolved by keeping BOTH paragraphs (the `insert` write-surface
+    note first, since it continues the statement-surface topic, then main's ACID-transactions caveat).
+  - Gates re-run on the merged tree BEFORE closing the merge: `cargo fmt --check`,
+    `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` (exit 0 — the
+    totals now include main's transaction tests) and `cargo deny check`, all green.
+  - Nothing lost, verified concretely: `git diff main..HEAD` after the merge lists only this
+    feature's 13 files; `LICENSE`, `README.md`, `drivers/anydb-postgres/examples/transactions_smoke.rs`
+    and `shared/src/driver/spi.rs` all present; both doc paragraphs present; no conflict markers left
+    in the repository.
+  - `main` fast-forwarded `bd7fa20` → `547267e` (`main` is a verified ancestor of the branch tip, so
+    the ff required no second merge commit), then pushed to `origin/main`.
+  - The branch `feature/mongo-insert-statement` remains local at the same commit; it was not pushed
+    because `main` already carries every commit.
