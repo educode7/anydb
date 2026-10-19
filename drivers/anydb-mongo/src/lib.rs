@@ -11,14 +11,17 @@
 //! (`ssl_mode: disable|require`, certificates always verified — there
 //! is no `prefer` because mongo has no negotiation probe).
 //!
-//! Statement surface: `"find <collection>"` executed as a single-batch
-//! `find` command (`singleBatch: true`, cursor closed). Parameters are
-//! not supported yet (a filter document language is future work); the
-//! typed mapping converts every BSON value through the shared
+//! Statement surface: `"find <collection> [with <filter-text>]"` executed
+//! as a `find` command: fetch-all (`limit 0`, `singleBatch: true`) for
+//! the SPI surface, cursor-id batch paging (`query_page_start` /
+//! `query_page_continue`, the postgres portal-paging analog, driver-level
+//! on purpose) otherwise. Filter text compiles to a BSON filter document
+//! client-side WITH typed parameter values — mongo has no wire binding,
+//! so `?` placeholders interpolate nothing: see `filter`. Errors around
+//! arity and syntax are `Protocol`, raised before any wire round-trip.
+//! The typed mapping converts every BSON value through the shared
 //! `TypedValue` contract, with extended-JSON rendering for embedded
-//! documents and ISO-8601 text for UTC datetimes. Cursor-id batch
-//! paging (`query_page_start` / `query_page_continue`, the postgres
-//! portal-paging analog) is driver-level on purpose.
+//! documents and ISO-8601 text for UTC datetimes.
 
 use std::sync::Arc;
 
@@ -26,6 +29,7 @@ use async_trait::async_trait;
 use tokio::sync::Mutex as AsyncMutex;
 
 pub mod bson;
+mod filter;
 mod op_msg;
 mod scram;
 pub mod uri;
@@ -114,26 +118,62 @@ fn resolve_target(request: &OpenRequest) -> Result<MongoTarget, ConnectionError>
     Ok(target)
 }
 
-/// The only statement form this vertical supports: `find <collection>`
-/// (single token, no whitespace).
-fn parse_find_statement(sql: &str) -> Result<String, ConnectionError> {
+/// The supported statement form: `find <collection> [with <filter-text>]`.
+/// The filter text keeps its original spacing — string literals inside it
+/// may contain any whitespace, so parsing slices the raw SQL instead of
+/// re-joining whitespace-split tokens.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FindStatement {
+    pub collection: String,
+    filter: Option<filter::Filter>,
+}
+
+impl FindStatement {
+    /// Compiles the `with` filter into its BSON document with the
+    /// statement parameters bound. A statement without a `with` clause
+    /// takes no parameters, always (mongodb Analog of postgres binding
+    /// errors appearing only at `Parse`/`Bind` time).
+    fn filter_document(
+        &self,
+        params: &[QueryParameter],
+    ) -> Result<bson::Document, ConnectionError> {
+        match &self.filter {
+            Some(filter) => filter.document(params),
+            None if params.is_empty() => Ok(bson::Document::new()),
+            None => Err(ConnectionError::Protocol(
+                "find statements without a 'with' filter take no parameters".to_owned(),
+            )),
+        }
+    }
+}
+
+/// Parses `find <collection> [with <filter-text>]` by slicing the raw
+/// SQL: the command word and collection are single tokens, everything
+/// after a standalone `with` is the verbatim filter text.
+fn parse_statement(sql: &str) -> Result<FindStatement, ConnectionError> {
     fn protocol(message: String) -> ConnectionError {
         ConnectionError::Protocol(format!("unsupported statement: {message}"))
     }
-    let mut tokens = sql.split_whitespace();
-    let (Some(command), Some(collection)) = (tokens.next(), tokens.next()) else {
+    // Leading whitespace only separates tokens; the collection and
+    // filter boundaries below still need single whitespace splits.
+    let sql = sql.trim_start();
+    let Some((command, tail)) = sql.split_once(char::is_whitespace) else {
         return Err(protocol(
-            "mongo statements are 'find <collection>'".to_owned(),
+            "mongo statements are 'find <collection> [with <filter>]'".to_owned(),
         ));
     };
     if command != "find" {
         return Err(protocol(
-            "mongo statements are 'find <collection>'".to_owned(),
+            "mongo statements are 'find <collection> [with <filter>]'".to_owned(),
         ));
     }
-    if tokens.next().is_some() {
+    let (collection, remainder) = match tail.trim_start().split_once(char::is_whitespace) {
+        Some((collection, remainder)) => (collection, remainder.trim_start()),
+        None => (tail.trim_start(), ""),
+    };
+    if collection.is_empty() {
         return Err(protocol(
-            "mongo statements are 'find <collection>' (one trailing token)".to_owned(),
+            "mongo statements are 'find <collection> [with <filter>]'".to_owned(),
         ));
     }
     if collection.starts_with('$') {
@@ -141,7 +181,26 @@ fn parse_find_statement(sql: &str) -> Result<String, ConnectionError> {
             "collection names may not start with '$'".to_owned(),
         ));
     }
-    Ok(collection.to_owned())
+    let filter = match remainder {
+        "" => None,
+        _ => {
+            let mut parts = remainder.splitn(2, char::is_whitespace);
+            if parts.next() != Some("with") {
+                return Err(protocol(format!(
+                    "unexpected tokens after the collection: '{remainder}'"
+                )));
+            }
+            // 'find c with' with nothing after dies in the empty-filter
+            // protocol error of the filter parser.
+            Some(filter::parse_filter(
+                parts.next().unwrap_or_default().trim_start(),
+            )?)
+        }
+    };
+    Ok(FindStatement {
+        collection: collection.to_owned(),
+        filter,
+    })
 }
 
 /// Live data source over exactly one wire connection; commands serialize
@@ -168,16 +227,20 @@ impl WireDataSource {
         }))
     }
 
-    /// Typed core shared by both SPI surfaces.
+    /// Typed core shared by both SPI surfaces. The filter compiles and
+    /// binds parameter values BEFORE any wire round-trip: arity and
+    /// syntax failures are pure client-side protocol errors.
     async fn find_typed(
         &self,
-        collection: String,
+        statement: &FindStatement,
+        params: &[QueryParameter],
     ) -> Result<TypedStatementResult, ConnectionError> {
+        let filter = statement.filter_document(params)?;
         let mut guard = self.connection.lock().await;
         let Some(connection) = guard.as_mut() else {
             return Err(ConnectionError::DriverFailure);
         };
-        let documents = connection.find(&collection).await?;
+        let documents = connection.find(&statement.collection, &filter).await?;
         let affected =
             i64::try_from(documents.len()).map_err(|_| ConnectionError::DriverFailure)?;
         Ok(bson::documents_to_result(
@@ -188,20 +251,27 @@ impl WireDataSource {
     }
 
     /// Typed driver surface of cursor paging (postgres `TypedPage`
-    /// shape). `limit = 0` degenerates to fetch-all. Each batch maps
-    /// through the shared `TypedValue` contract independently: mongo is
-    /// schemaless, so unlike the postgres portal the columns are
-    /// re-derived per batch and may legally change between batches.
+    /// shape). Takes the VERBATIM statement (like the postgres
+    /// `query_page_start(sql, params, limit)`): `limit = 0` degenerates
+    /// to fetch-all, and each batch maps through the shared
+    /// `TypedValue` contract independently — mongo is schemaless, so
+    /// unlike the postgres portal the columns are re-derived per batch
+    /// and may legally change between batches.
     pub async fn query_page_start(
         &self,
-        collection: &str,
+        sql: &str,
+        params: &[QueryParameter],
         limit: i32,
     ) -> Result<WirePage, ConnectionError> {
+        let statement = parse_statement(sql)?;
+        let filter = statement.filter_document(params)?;
         let mut guard = self.connection.lock().await;
         let Some(connection) = guard.as_mut() else {
             return Err(ConnectionError::DriverFailure);
         };
-        let page = connection.find_page_start(collection, limit).await?;
+        let page = connection
+            .find_page_start(&statement.collection, &filter, limit)
+            .await?;
         Ok(typed_batch(&page))
     }
 
@@ -256,21 +326,15 @@ impl DataSource for WireDataSource {
         })
     }
 
-    /// Typed execution: the shared `TypedValue` contract applied to
-    /// every BSON value (embedded documents as extended JSON, datetimes
-    /// as ISO-8601 text).
+    /// Typed execution: `find <collection> [with <filter>]` with `?`
+    /// parameters bound to typed BSON values client-side.
     async fn execute_statement_typed(
         &self,
         sql: &str,
         params: &[QueryParameter],
     ) -> Result<TypedStatementResult, ConnectionError> {
-        if !params.is_empty() {
-            return Err(ConnectionError::Protocol(
-                "'find <collection>' statements take no parameters yet".to_owned(),
-            ));
-        }
-        let collection = parse_find_statement(sql)?;
-        self.find_typed(collection).await
+        let statement = parse_statement(sql)?;
+        self.find_typed(&statement, params).await
     }
 
     async fn close(&self) {
@@ -333,19 +397,49 @@ mod tests {
 
     #[test]
     fn find_statements_parse_their_collection() {
+        let plain = parse_statement("find orders").expect("parsed");
+        assert_eq!(plain.collection, "orders");
+        assert!(plain.filter.is_none());
+        let spaced = parse_statement("  find  system.users  ").expect("parsed");
+        assert_eq!(spaced.collection, "system.users");
+        assert!(spaced.filter.is_none());
+        let filtered = parse_statement("find c1 with n = 3").expect("parsed");
+        assert_eq!(filtered.collection, "c1");
         assert_eq!(
-            parse_find_statement("find orders").expect("parsed"),
-            "orders"
+            filtered.filter_document(&[]).expect("bind"),
+            vec![("n".to_owned(), bson::Bson::Int32(3))]
         );
+        // The filter text keeps its whitespace: string literals win.
+        let spaced = parse_statement("find c1 with txt = 'two  spaces'").expect("parsed");
         assert_eq!(
-            parse_find_statement("  find  system.users  ").expect("parsed"),
-            "system.users"
+            spaced.filter_document(&[]).expect("bind"),
+            vec![(
+                "txt".to_owned(),
+                bson::Bson::String("two  spaces".to_owned())
+            )]
         );
-        assert!(parse_find_statement("").is_err());
-        assert!(parse_find_statement("find").is_err());
-        assert!(parse_find_statement("drop db").is_err());
-        assert!(parse_find_statement("find db extra").is_err());
-        assert!(parse_find_statement("find $cmd").is_err());
+        // Two placeholders bind to exactly the two supplied params.
+        let parameterized = parse_statement("find c1 with n = ? and tag = ?").expect("parsed");
+        assert!(parameterized.filter_document(&[]).is_err());
+        assert_eq!(
+            parameterized
+                .filter_document(&[
+                    QueryParameter::Integer(7),
+                    QueryParameter::Text("a".to_owned()),
+                ])
+                .expect("bind"),
+            vec![
+                ("n".to_owned(), bson::Bson::Int64(7)),
+                ("tag".to_owned(), bson::Bson::String("a".to_owned())),
+            ]
+        );
+        assert!(parse_statement("").is_err());
+        assert!(parse_statement("find").is_err());
+        assert!(parse_statement("drop db").is_err());
+        assert!(parse_statement("find db extra").is_err());
+        assert!(parse_statement("find c1 with").is_err());
+        assert!(parse_statement("find c1 with n = ? and").is_err());
+        assert!(parse_statement("find $cmd").is_err());
     }
 
     #[test]

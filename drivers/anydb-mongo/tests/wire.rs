@@ -626,7 +626,7 @@ async fn statement_forms_beyond_find_and_params_are_rejected() {
         .await
         .expect_err("params refused");
     assert!(
-        matches!(error, ConnectionError::Protocol(message) if message.contains("no parameters yet"))
+        matches!(error, ConnectionError::Protocol(message) if message.contains("take no parameters"))
     );
     server.shutdown().await;
 }

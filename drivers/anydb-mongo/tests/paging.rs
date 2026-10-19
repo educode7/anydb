@@ -223,7 +223,7 @@ async fn paged_cursor_streams_the_whole_answer_in_batches() {
 
     let mut connection = connection_for(port).await;
     let first = connection
-        .find_page_start("c1", 2)
+        .find_page_start("c1", &Document::new(), 2)
         .await
         .expect("first batch");
     assert!(first.suspended);
@@ -272,7 +272,10 @@ async fn driver_surface_types_the_batches() {
     };
     let source = source_for(port).await;
 
-    let first = source.query_page_start("c1", 2).await.expect("first batch");
+    let first = source
+        .query_page_start("find c1", &[], 2)
+        .await
+        .expect("first batch");
     assert!(first.suspended);
     assert_eq!(first.result.columns, vec!["n"]);
     assert_eq!(
@@ -369,13 +372,13 @@ async fn a_fresh_start_kills_the_abandoned_cursor() {
     let mut connection = connection_for(port).await;
 
     let first = connection
-        .find_page_start("c1", 2)
+        .find_page_start("c1", &Document::new(), 2)
         .await
         .expect("first batch");
     assert!(first.suspended);
 
     let fresh = connection
-        .find_page_start("c1", 2)
+        .find_page_start("c1", &Document::new(), 2)
         .await
         .expect("fresh batch");
     assert!(!fresh.suspended, "cursor id 0 completes the flow");
@@ -448,7 +451,10 @@ async fn limit_zero_degenerates_to_fetch_all() {
     let (port, server) = spawn_server(fetch_all_server);
     let mut connection = connection_for(port).await;
 
-    let page = connection.find_page_start("c1", 0).await.expect("all");
+    let page = connection
+        .find_page_start("c1", &Document::new(), 0)
+        .await
+        .expect("all");
     assert!(!page.suspended);
     assert_eq!(page.total, 3);
     // limit=0 answers in one batch: no cursor to continue.
@@ -462,7 +468,10 @@ async fn limit_zero_degenerates_to_fetch_all() {
     ));
     // And a terminated abandoned state never leaks: the fresh one-shot
     // find (same contract) works on the same connection.
-    let docs = connection.find("c1").await.expect("one-shot still works");
+    let docs = connection
+        .find("c1", &Vec::new())
+        .await
+        .expect("one-shot still works");
     assert_eq!(docs.len(), 1);
 
     connection.terminate().await;
@@ -502,7 +511,7 @@ async fn validation_fails_fast_and_keeps_the_connection() {
     let mut connection = connection_for(port).await;
 
     let error = connection
-        .find_page_start("c1", -1)
+        .find_page_start("c1", &Document::new(), -1)
         .await
         .expect_err("negative limit");
     assert!(matches!(
@@ -519,7 +528,7 @@ async fn validation_fails_fast_and_keeps_the_connection() {
     ));
 
     // The connection is untouched: a valid fetch-all flows normally.
-    let page = connection.find_page_start("c1", 0).await;
+    let page = connection.find_page_start("c1", &Document::new(), 0).await;
     // The scripted server rejects every command; what matters is that
     // the failure is a server command failure, not a local one.
     assert!(matches!(page, Err(ConnectionError::ExecutionFailed { .. })));
@@ -571,7 +580,7 @@ async fn a_failing_get_more_clears_the_suspended_cursor() {
     let mut connection = connection_for(port).await;
 
     connection
-        .find_page_start("c1", 2)
+        .find_page_start("c1", &Document::new(), 2)
         .await
         .expect("first batch suspends");
     let error = connection

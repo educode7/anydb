@@ -289,10 +289,14 @@ impl Connection {
         scram.server_final(&payload)
     }
 
-    /// Fetch-all `find`: single batch, cursor closed by the server.
-    /// Internally the degenerate `limit = 0` case of `find_page_start`.
-    pub async fn find(&mut self, collection: &str) -> Result<Vec<Document>, ConnectionError> {
-        let page = self.find_page_start(collection, 0).await?;
+    /// Fetch-all `find` without extra filtering (internal degenerate
+    /// case of `find_page_start` used by the SPI surface).
+    pub async fn find(
+        &mut self,
+        collection: &str,
+        filter: &Document,
+    ) -> Result<Vec<Document>, ConnectionError> {
+        let page = self.find_page_start(collection, filter, 0).await?;
         debug_assert!(!page.suspended);
         Ok(page.documents)
     }
@@ -310,6 +314,7 @@ impl Connection {
     pub async fn find_page_start(
         &mut self,
         collection: &str,
+        filter: &Document,
         limit: i32,
     ) -> Result<CursorPage, ConnectionError> {
         if limit < 0 {
@@ -323,7 +328,7 @@ impl Connection {
 
         let mut command = Document::from(vec![
             ("find".to_owned(), Bson::String(collection.to_owned())),
-            ("filter".to_owned(), Bson::Document(Document::new())),
+            ("filter".to_owned(), Bson::Document(filter.to_vec())),
         ]);
         if limit == 0 {
             // Fetch-all: one batch, server closes the cursor.
