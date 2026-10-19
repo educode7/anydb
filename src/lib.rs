@@ -18,8 +18,9 @@ use anydb_connections::connection::application::commands::connect::ConnectOutcom
 use anydb_connections::connection::application::dtos::container_status_dto::ContainerStatusDto;
 use anydb_connections::connection::application::jobs::ConnectionJob;
 use anydb_connections::connection::infrastructure::job_queue::BoundJobQueue;
+use anydb_connections::connection::infrastructure::monitor;
 use anydb_connections::connection::infrastructure::monitor::{
-    KeepAliveLoopConfig, LoopHandle, spawn_keepalive_loop,
+    KeepAliveLoopConfig, LoopHandle, MonitorLoopConfig, spawn_keepalive_loop,
 };
 use anydb_connections::execution::application::commands::execute_with_recovery::RecoveryRunner;
 use anydb_connections::execution::domain::ports::invalidation_target::InvalidationTarget;
@@ -50,6 +51,7 @@ pub mod prelude {
     pub use anydb_connections::connection::infrastructure::in_memory_secrets::InMemorySecretsStore;
     pub use anydb_connections::connection::infrastructure::job_queue::BoundJobQueue;
     pub use anydb_connections::connection::infrastructure::monitor::KeepAliveLoopConfig;
+    pub use anydb_connections::connection::infrastructure::monitor::MonitorLoopConfig;
     pub use anydb_connections::connection::infrastructure::noop_events::NoOpEvents;
     pub use anydb_connections::execution::application::commands::execute_with_recovery::RecoveryRunner;
     pub use anydb_connections::execution::domain::ports::error_classifier::ErrorClassifier;
@@ -111,6 +113,31 @@ impl App {
         let handle = {
             let mut tasks = self.tasks.lock().unwrap_or_else(PoisonError::into_inner);
             spawn_keepalive_loop(&self.module, config, &mut tasks)
+        };
+        self.loops
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(handle);
+    }
+
+    /// Auto-restore policy of a container (DBeaver monitor auto-connect
+    /// analog): the monitor loop only reconciles flagged containers.
+    pub fn set_auto_reconnect(&self, container_id: &str, enabled: bool) -> ConnectionResult<()> {
+        self.module
+            .container(container_id)?
+            .set_auto_reconnect(enabled);
+        Ok(())
+    }
+
+    /// Spawns the state-reconciliation loop (DBeaver
+    /// `DataSourceMonitorJob` analog): auto-restore containers get their
+    /// reconnect work scheduled through the serialized job queue, with
+    /// bounded attempts and cooldown spacing. The handle is stored so
+    /// `shutdown` cancels it.
+    pub fn spawn_monitor_loop(&self, config: MonitorLoopConfig) {
+        let handle = {
+            let mut tasks = self.tasks.lock().unwrap_or_else(PoisonError::into_inner);
+            monitor::spawn_monitor_loop(&self.module, &self.queue, config, &mut tasks)
         };
         self.loops
             .lock()

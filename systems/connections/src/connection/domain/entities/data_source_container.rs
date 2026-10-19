@@ -20,6 +20,9 @@ pub struct ContainerState {
     config: RwLock<ContainerConfig>,
     status: RwLock<ContainerStatus>,
     connected: RwLock<Option<Arc<dyn DataSource>>>,
+    /// Auto-restore policy (DBeaver monitor auto-connect analog): the
+    /// monitor loop only reconciles containers flagged with it.
+    auto_reconnect: RwLock<bool>,
 }
 
 impl fmt::Debug for ContainerState {
@@ -43,6 +46,7 @@ impl ContainerState {
             config: RwLock::new(config),
             status: RwLock::new(ContainerStatus::Disconnected),
             connected: RwLock::new(None),
+            auto_reconnect: RwLock::new(false),
         })
     }
 
@@ -115,5 +119,20 @@ impl ContainerState {
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .take()
+    }
+
+    /// Auto-restore policy of the monitor loop; `false` by default so
+    /// user-owned lifecycle stays user-owned.
+    pub fn auto_reconnect(&self) -> bool {
+        *self
+            .auto_reconnect
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub fn set_auto_reconnect(&self, enabled: bool) {
+        if let Ok(mut guard) = self.auto_reconnect.write() {
+            *guard = enabled;
+        }
     }
 }

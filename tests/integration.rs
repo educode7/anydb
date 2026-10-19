@@ -96,7 +96,7 @@ impl Driver for OkDriver {
     }
 }
 
-struct MetadataSource;
+pub struct MetadataSource;
 
 #[async_trait::async_trait]
 impl DataSource for MetadataSource {
@@ -609,6 +609,105 @@ async fn aborted_transaction_recovery_rolls_back_the_live_connection() {
 
     let snapshot = events.entries.lock().await.clone();
     assert!(snapshot.contains(&"dsr2:InvalidatedTransaction".to_string()));
+
+    app.shutdown().await;
+}
+
+// ---------- monitor loop auto-restore through the pipeline ----------
+
+struct MonitorSource;
+
+#[async_trait::async_trait]
+impl DataSource for MonitorSource {
+    fn metadata(&self) -> DataSourceMetadata {
+        DataSourceMetadata {
+            product_name: "Fake".into(),
+            product_version: "0".into(),
+            driver_name: "fake-monitor".into(),
+        }
+    }
+
+    async fn ping(&self) -> ConnectionResult<()> {
+        Err(ConnectionError::NetworkFailure)
+    }
+
+    async fn close(&self) {}
+}
+
+struct MonitorDriver {
+    descriptor: DriverDescriptor,
+    opens: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Driver for MonitorDriver {
+    fn descriptor(&self) -> &DriverDescriptor {
+        &self.descriptor
+    }
+
+    async fn open_data_source(
+        &self,
+        _request: OpenRequest,
+    ) -> ConnectionResult<Arc<dyn DataSource>> {
+        self.opens.fetch_add(1, Ordering::SeqCst);
+        Ok(Arc::new(MonitorSource) as Arc<dyn DataSource>)
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn monitor_loop_auto_restores_a_dead_container() {
+    let events = RecordingEvents::new();
+    let secrets = MemorySecrets::new();
+    secrets.register("mds1");
+    let secrets_dyn: Arc<dyn SecretsStore> = secrets;
+    let events_dyn: Arc<dyn ConnectionEvents> = events.clone();
+    let app = App::new(secrets_dyn, events_dyn);
+
+    let opens = Arc::new(AtomicUsize::new(0));
+    app.add_container(
+        Arc::new(MonitorDriver {
+            descriptor: DriverDescriptor::new("fake-monitor", "Fake Monitor", true),
+            opens: opens.clone(),
+        }),
+        "mds1",
+        ConnectionProperties::new("monitor://host"),
+        vec![],
+    );
+    app.set_auto_reconnect("mds1", true)
+        .expect("set auto reconnect");
+    app.spawn_monitor_loop(MonitorLoopConfig {
+        interval: std::time::Duration::from_millis(10),
+        ping_timeout: std::time::Duration::from_secs(1),
+        reconnect_cooldown: std::time::Duration::from_millis(20),
+        max_reconnect_attempts: 3,
+    });
+    app.connect("mds1").await.expect("connect ok");
+
+    // 20 ticks cover the whole cycle: one death -> invalidate + three
+    // bounded automatic restores -> give up.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    assert_eq!(
+        opens.load(Ordering::SeqCst),
+        4,
+        "one manual connect plus exactly three automatic attempts"
+    );
+    let entries = events.entries.lock().await;
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| entry.ends_with("AfterConnect"))
+            .count(),
+        4
+    );
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| entry.ends_with("InvalidatedDataSource"))
+            .count(),
+        4
+    );
+    drop(entries);
 
     app.shutdown().await;
 }

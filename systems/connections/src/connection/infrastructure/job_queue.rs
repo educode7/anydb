@@ -36,4 +36,10 @@ impl BoundJobQueue {
             .await
             .map_err(|_| ConnectionError::Canceled)
     }
+
+    /// Sender clone for supervised producers of lifecycle jobs (the
+    /// monitor loop enqueues reconciliation work through this channel).
+    pub fn sender(&self) -> mpsc::Sender<ConnectionJob> {
+        self.tx.clone()
+    }
 }

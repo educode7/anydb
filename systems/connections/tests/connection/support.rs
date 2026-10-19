@@ -180,7 +180,6 @@ pub struct PingDriver {
     pings: Arc<AtomicUsize>,
     fail_ping: bool,
 }
-
 impl PingDriver {
     /// Returns the driver plus shared counters for opens and pings.
     pub fn new(fail_ping: bool) -> (Arc<Self>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
@@ -244,6 +243,86 @@ impl DataSource for PingSource {
     async fn close(&self) {}
 }
 
+/// Ping source whose failure mode flips at runtime: the monitor tests
+/// stage "dead network" and "recovered network" phases through one flag.
+pub struct TogglePingDriver {
+    descriptor: DriverDescriptor,
+    opens: Arc<AtomicUsize>,
+    pings: Arc<AtomicUsize>,
+    fail: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl TogglePingDriver {
+    /// Returns the driver plus the opens/pings counters and the failure
+    /// flag (`true` = pings fail).
+    pub fn new() -> (
+        Arc<Self>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let opens = Arc::new(AtomicUsize::new(0));
+        let pings = Arc::new(AtomicUsize::new(0));
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        (
+            Arc::new(Self {
+                descriptor: DriverDescriptor::new("ping", "Ping", true),
+                opens: opens.clone(),
+                pings: pings.clone(),
+                fail: fail.clone(),
+            }),
+            opens,
+            pings,
+            fail,
+        )
+    }
+}
+
+#[async_trait]
+impl Driver for TogglePingDriver {
+    fn descriptor(&self) -> &DriverDescriptor {
+        &self.descriptor
+    }
+
+    async fn open_data_source(
+        &self,
+        _request: OpenRequest,
+    ) -> Result<Arc<dyn DataSource>, ConnectionError> {
+        self.opens.fetch_add(1, Ordering::SeqCst);
+        Ok(Arc::new(TogglePingSource {
+            pings: self.pings.clone(),
+            fail: self.fail.clone(),
+        }))
+    }
+}
+
+struct TogglePingSource {
+    pings: Arc<AtomicUsize>,
+    fail: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait]
+impl DataSource for TogglePingSource {
+    fn metadata(&self) -> DataSourceMetadata {
+        DataSourceMetadata {
+            product_name: "Ping".to_owned(),
+            product_version: "0".to_owned(),
+            driver_name: "ping".to_owned(),
+        }
+    }
+
+    async fn ping(&self) -> Result<(), ConnectionError> {
+        self.pings.fetch_add(1, Ordering::SeqCst);
+        if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+            Err(ConnectionError::NetworkFailure)
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn close(&self) {}
+}
+
 pub fn module_with_secrets(secrets: Arc<dyn SecretsStore>) -> Arc<ConnectionModule> {
     let clock: Arc<dyn Clock> = Arc::new(anydb_shared::ports::SystemClock);
     ConnectionModule::new(
@@ -251,4 +330,17 @@ pub fn module_with_secrets(secrets: Arc<dyn SecretsStore>) -> Arc<ConnectionModu
         secrets,
         Arc::new(RecordingEvents::default()) as Arc<dyn ConnectionEvents>,
     )
+}
+
+/// Module wired with a retained `RecordingEvents` handle so tests can
+/// assert the event stream the commands emit.
+pub fn module_with_events() -> (Arc<ConnectionModule>, Arc<RecordingEvents>) {
+    let clock: Arc<dyn Clock> = Arc::new(anydb_shared::ports::SystemClock);
+    let events = Arc::new(RecordingEvents::default());
+    let module = ConnectionModule::new(
+        clock,
+        ScriptedSecrets::ok() as Arc<dyn SecretsStore>,
+        events.clone() as Arc<dyn ConnectionEvents>,
+    );
+    (module, events)
 }
