@@ -195,6 +195,20 @@ fn typed_data_row(values: &[Option<&[u8]>]) -> Vec<u8> {
     payload
 }
 
+/// Builds a numeric binary payload (ndigits, weight, sign, dscale as
+/// int16's, then the base-10000 digit groups) — the layout verified
+/// against the live postgres in the numeric smoke.
+fn numeric_be(weight: i16, dscale: u16, groups: &[u16]) -> Vec<u8> {
+    let mut bytes = (groups.len() as u16).to_be_bytes().to_vec();
+    bytes.extend_from_slice(&weight.to_be_bytes());
+    bytes.extend_from_slice(&0u16.to_be_bytes()); // sign: positive
+    bytes.extend_from_slice(&dscale.to_be_bytes());
+    for group in groups {
+        bytes.extend_from_slice(&group.to_be_bytes());
+    }
+    bytes
+}
+
 fn target(address: std::net::SocketAddr) -> anydb_postgres::url::PostgresTarget {
     anydb_postgres::url::PostgresTarget {
         host: address.ip().to_string(),
@@ -257,7 +271,7 @@ async fn typed_row_cycle_server(mut stream: TcpStream) {
             ("f", types::oid::FLOAT8),
             ("b", types::oid::BOOL),
             ("x", types::oid::TEXT),
-            ("num", 1700), // numeric: outside the catalog -> text
+            ("num", 1700), // numeric: binary since the catalog covers it
         ]),
     )
     .await;
@@ -273,7 +287,7 @@ async fn typed_row_cycle_server(mut stream: TcpStream) {
             Some(&[1]),
             Some(b"hola"),
         ],
-        &[1, 1, 1, 1, 0],
+        &[1, 1, 1, 1, 1],
     )
     .await;
     assert_execute_unlimited(&mut stream).await;
@@ -288,14 +302,20 @@ async fn typed_row_cycle_server(mut stream: TcpStream) {
             Some(&float_be),
             Some(&[1]),
             Some(b"hola"),
-            Some(b"1.23"),
+            Some(&numeric_be(0, 2, &[1, 2300])), // 1.23
         ]),
     )
     .await;
     send(
         &mut stream,
         b'D',
-        &typed_data_row(&[None, Some(&float_be_2), Some(&[0]), None, Some(b"7.8")]),
+        &typed_data_row(&[
+            None,
+            Some(&float_be_2),
+            Some(&[0]),
+            None,
+            Some(&numeric_be(0, 2, &[7, 8000])), // 7.80
+        ]),
     )
     .await;
     send(&mut stream, b'C', b"SELECT 2\0").await;
@@ -335,14 +355,14 @@ async fn execute_statement_typed_goes_through_the_spi() {
                 Some(TypedValue::Float8(3.5)),
                 Some(TypedValue::Boolean(true)),
                 Some(TypedValue::Text("hola".into())),
-                Some(TypedValue::Text("1.23".into())),
+                Some(TypedValue::BigDecimal("1.23".into())),
             ],
             vec![
                 None,
                 Some(TypedValue::Float8(2.5)),
                 Some(TypedValue::Boolean(false)),
                 None,
-                Some(TypedValue::Text("7.8".into())),
+                Some(TypedValue::BigDecimal("7.80".into())),
             ],
         ]
     );
@@ -405,14 +425,14 @@ async fn typed_query_decodes_cataloged_columns_and_nulls() {
                 Some(TypedValue::Float8(3.5)),
                 Some(TypedValue::Boolean(true)),
                 Some(TypedValue::Text("hola".into())),
-                Some(TypedValue::Text("1.23".into())),
+                Some(TypedValue::BigDecimal("1.23".into())),
             ],
             vec![
                 None,
                 Some(TypedValue::Float8(2.5)),
                 Some(TypedValue::Boolean(false)),
                 None,
-                Some(TypedValue::Text("7.8".into())),
+                Some(TypedValue::BigDecimal("7.80".into())),
             ],
         ]
     );
