@@ -21,6 +21,28 @@
 use anydb_shared::ConnectionError;
 use anydb_shared::driver::statement::{TypedStatementResult, TypedValue};
 
+/// BSON shape of a numeric literal: integers fit `Int32` when they can
+/// (mongo shell convention), fall back to `Int64`; decimals and
+/// exponents render as `Double`. Shared by the filter literal and the
+/// insert document literal so both bind the same text to the same BSON
+/// type; the CALLER owns any statement-context prefix in the message.
+pub(crate) fn number_literal(raw: &str) -> Result<Bson, ConnectionError> {
+    if let Ok(value) = raw.parse::<i32>() {
+        return Ok(Bson::Int32(value));
+    }
+    if let Ok(value) = raw.parse::<i64>() {
+        return Ok(Bson::Int64(value));
+    }
+    if !raw.contains(['.', 'e', 'E']) {
+        return Err(ConnectionError::Protocol(format!(
+            "integer literal '{raw}' does not fit i64"
+        )));
+    }
+    raw.parse::<f64>()
+        .map(Bson::Double)
+        .map_err(|_| ConnectionError::Protocol(format!("invalid numeric literal '{raw}'")))
+}
+
 /// A parsed BSON value. Documents and arrays keep field order.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Bson {

@@ -759,22 +759,14 @@ fn keyword(ident: &str) -> Option<Keyword> {
 
 /// BSON shape of a numeric literal: integers fit `Int32` when they can
 /// (mongo shell convention), fall back to `Int64`; decimals and
-/// exponents render as `Double`.
+/// exponents render as `Double`. The shape itself is shared with the
+/// insert document literal (`bson::number_literal`); only the
+/// statement-context prefix belongs to the filter.
 fn number_bson(raw: &str) -> Result<Bson, ConnectionError> {
-    if let Ok(value) = raw.parse::<i32>() {
-        return Ok(Bson::Int32(value));
-    }
-    if let Ok(value) = raw.parse::<i64>() {
-        return Ok(Bson::Int64(value));
-    }
-    if !raw.contains(['.', 'e', 'E']) {
-        return Err(protocol(format!(
-            "integer literal '{raw}' does not fit i64"
-        )));
-    }
-    raw.parse::<f64>()
-        .map(Bson::Double)
-        .map_err(|_| protocol(format!("invalid numeric literal '{raw}'")))
+    crate::bson::number_literal(raw).map_err(|error| match error {
+        ConnectionError::Protocol(message) => protocol(message),
+        other => other,
+    })
 }
 
 // ---------- tokenizer ----------
