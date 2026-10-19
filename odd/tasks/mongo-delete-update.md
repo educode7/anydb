@@ -13,6 +13,29 @@ them yields commits that do not compile. Test runner: `cargo test --workspace`
 
 ## Specs
 
+### S7 — `delete one` (iteration 2, after the main delivery)
+
+"Aceptación visible" also for surgical removal: `delete one <collection> with <filter-text>`
+compiles to `{ delete: <collection>, deletes: [ { q: <compiled filter>, limit: 1 } ] }` — at
+most the FIRST matching document (server order) goes, and the acceptance honestly reports a
+zero when nothing matched ("delete docs: 0 document(s) removed" instead of a silent OK).
+
+- The standalone token `one` right after `delete` is RESERVED as the single-document
+  modifier, mirroring the filter grammar's reserved leading `not`: a collection literally
+  named `one` is not addressable in this surface (`delete one` alone, or `delete one` with a
+  filter craving a collection, answer the `delete one` form hint before any wire bytes).
+- Everything else keeps the iteration-1 contract: filter required, `?` parameters bind in
+  the compiled filter, execution only through `execute_statement_typed_confirmed`,
+  `writeErrors` and missing counts surface as failures, tag stays `delete <n>`, and the
+  plain all-matching `delete <collection> with <filter>` is byte-identical to before.
+
+### S8 — live smoke leg for the single-document form
+
+The existing live smoke gains a surgical leg between the all-matching deletions: after the
+first removal (2 documents remain), `delete one docs with tag = 'smoke-b'` removes exactly
+one and `find` shows both the survivor and the modified state; the final all-matching
+deletion then drains the throwaway collection.
+
 ### S1 — statement surface accepts `delete` and `update`
 
 `parse_statement` accepts exactly four statement forms: the existing
@@ -110,8 +133,9 @@ plus the new `delete <collection> with <filter-text>` and
 | T2 | S2 | inline | done | `the_unconfirmed_delete_refuses_and_the_connection_survives` (pre-wire gate refusal naming the seam, then the confirmed delete runs on the same connection) + integration `the_confirmed_seam_defaults_to_the_ordinary_typed_path` (default delegation) — commit `0aba548` |
 | T3 | S3, S4 | inline | done | fake mongod asserts `{delete, deletes:[{q, limit:0}]}` and `{update, updates:[{q,u,upsert:false,multi:true}]}` with the compiled filter bound (`QueryParameter::Integer` -> BSON Int64); `writeErrors` surface; missing `n` / `nModified` are protocol errors naming the command context — commit `0aba548` |
 | T4 | S5 | inline | done | `message` rides both shared structs (all foreign construction sites `None`); paging rejects delete/update; text surface copies the message — commit `0aba548` |
-| T5 | S6 | inline | done | live on mongo 7.0 (`anydb-mongo` container): gate refusal verbatim, `insert 1` x3, `update docs: 1 matched, 1 modified` verified server-side (`find 1`), `delete docs: 1 document(s) removed` (`find 2`), `delete docs: 2 document(s) removed`, `find 0` — throwaway `anydb-scrap` db, exit 0 |
+| T5 | S6, S8 | inline | done | live on mongo 7.0 (`anydb-mongo` container): gate refusal verbatim, `insert 1` x3, `update docs: 1 matched, 1 modified` verified server-side (`find 1`), `delete docs: 1 document(s) removed` (`find 2`), `delete one` surgical leg (`delete docs: 1 document(s) removed`, `find 1`), final `delete docs: 1 document(s) removed`, `find 0` — throwaway `anydb-scrap` db, exit 0 |
 | T6 | all | inline | done | `cargo test --workspace` exit 0 (224 passed, 0 failed across all targets), `cargo clippy --workspace --all-targets -- -D warnings` exit 0, `cargo fmt`, `cargo deny check` (advisories/bans/licenses/sources ok) — on the tree of `0aba548` |
+| T7 | S7, S8 | inline | done | 3 new tests (29 in statement.rs, 227 workspace-wide, all gates exit 0), copy `delete one` live evidence into the T5 cell (its smoke leg ran on this increment's tree) |
 
 ## Log
 
@@ -143,3 +167,10 @@ plus the new `delete <collection> with <filter-text>` and
 - L7 (2026-10-19, delivery): the doc commit is `odd/tasks/mongo-delete-update.md` itself
   (single commit right behind `0aba548`). Push stays a human decision per the adopted
   delivery strategy.
+- L8 (2026-10-19, iteration 2 decision; user pick "1" = `delete one`): the single-document
+  form is `delete one <collection> with <filter-text>` with the token `one` RESERVED right
+  after `delete` — the filter grammar's reserved leading `not` precedent, no backtracking
+  parse; a collection named `one` is not addressable in this surface. Only the wire `limit`
+  changes (0 stays default, 1 for the modifier); the acceptance contract (tag `delete <n>`,
+  message shape) is unchanged, and the copy fills the same `message` field. The all-matching
+  form remains byte-identical.
