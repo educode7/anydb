@@ -165,6 +165,160 @@ fn numeric_decode(bytes: &[u8]) -> Result<TypedValue, ConnectionError> {
     Ok(render_numeric(sign == NUMERIC_NEG, weight, dscale, &groups))
 }
 
+/// Encodes canonical decimal text into the external binary form: the
+/// inverse of `numeric_recv`, ported from postgres `set_var_from_str`
+/// plus `strip_var` — decimal digits with an optional signed exponent,
+/// folded into base-10000 groups at decimal alignment, then stripped
+/// of leading/trailing zero groups (the all-zero value normalizes to
+/// POSITIVE with weight 0, exactly like the text path). Specials carry
+/// the exact sign codes with no digits. The wire limits `numeric_recv`
+/// enforces (dscale above the 14-bit mask, weight outside int16) are
+/// checked HERE, before any wire byte is written.
+pub fn numeric_binary(text: &str) -> Result<Vec<u8>, ConnectionError> {
+    let invalid =
+        || ConnectionError::Protocol(format!("invalid decimal text for 'numeric' bind: '{text}'"));
+    let overflow = || {
+        ConnectionError::Protocol(format!(
+            "decimal text '{text}' overflows the numeric wire format"
+        ))
+    };
+
+    // `numeric_in` hospitality: surrounding spaces skip; the special
+    // words compare case-insensitively — and NaN carries no sign.
+    let text = text.trim();
+    if text.eq_ignore_ascii_case("nan") {
+        return Ok(pack_numeric(0, NUMERIC_NAN, 0, &[]));
+    }
+    let (negative, body) = match text.as_bytes().first() {
+        Some(b'-') => (true, &text[1..]),
+        Some(b'+') => (false, &text[1..]),
+        _ => (false, text),
+    };
+    if body.eq_ignore_ascii_case("infinity") || body.eq_ignore_ascii_case("inf") {
+        return Ok(pack_numeric(
+            0,
+            if negative { NUMERIC_NINF } else { NUMERIC_PINF },
+            0,
+            &[],
+        ));
+    }
+
+    // One decimal point inside the digits; at most one `e` exponent
+    // with an optional sign and required digits (C's `out_of_range`
+    // guard: the exponent may not exceed INT32_MAX/2).
+    let (mantissa, exponent) = match body.find(['e', 'E']) {
+        Some(split) => {
+            let exp_text = &body[split + 1..];
+            let (neg_exp, exp_digits) = match exp_text.as_bytes().first() {
+                Some(b'-') => (true, &exp_text[1..]),
+                Some(b'+') => (false, &exp_text[1..]),
+                _ => (false, exp_text),
+            };
+            if exp_digits.is_empty() || !exp_digits.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(invalid());
+            }
+            let mut exponent: i64 = 0;
+            for digit in exp_digits.bytes() {
+                exponent = exponent * 10 + i64::from(digit - b'0');
+                if exponent > 1_073_741_823 {
+                    return Err(overflow());
+                }
+            }
+            (&body[..split], if neg_exp { -exponent } else { exponent })
+        }
+        None => (body, 0),
+    };
+    let (int_part, frac_part) = match mantissa.split_once('.') {
+        Some((int_part, frac_part)) => (int_part, frac_part),
+        None => (mantissa, ""),
+    };
+    // Empty parts pass vacuously ("5.", ".5" are valid); the zero-digit
+    // check below rejects a mantissa without any digit at all.
+    for part in [int_part, frac_part] {
+        if !part.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(invalid());
+        }
+    }
+    // `set_var_from_str`: dweight counts down to the first integer
+    // digit; dscale counts the fraction digits.
+    let ddigits = (int_part.len() + frac_part.len()) as i64;
+    if ddigits == 0 {
+        return Err(invalid());
+    }
+    let dweight = (int_part.len() as i64) - 1 + exponent;
+    let mut dscale = (frac_part.len() as i64) - exponent;
+    if dscale < 0 {
+        dscale = 0;
+    }
+
+    // The converted weight and ndigits: `offset` is the number of
+    // decimal zeros BEFORE the first given digit so the first NBASE
+    // group aligns (always 0..=3 with this weight formula).
+    if dscale > i64::from(NUMERIC_DSCALE_MASK) {
+        return Err(overflow());
+    }
+    let dscale_u = dscale as u16;
+    let mut weight: i64 = if dweight >= 0 {
+        (dweight + 1 + 3) / 4 - 1
+    } else {
+        -((-dweight - 1) / 4 + 1)
+    };
+    if weight > i64::from(i16::MAX) || weight < i64::from(i16::MIN) {
+        return Err(overflow());
+    }
+    let offset = (weight + 1) * 4 - (dweight + 1);
+    let ndigits = (ddigits + offset + 3) / 4;
+
+    // `decdigits`: DEC_DIGITS leading zeros, the digit characters, then
+    // DEC_DIGITS - 1 trailing zeros; every group reads four positions.
+    let mut decdigits = vec![0u8; ddigits as usize + 7];
+    for (step, digit) in int_part.bytes().chain(frac_part.bytes()).enumerate() {
+        decdigits[4 + step] = digit - b'0';
+    }
+    let read = |i: usize| u16::from(decdigits[i]);
+    let mut i = 4usize - offset as usize;
+    let mut groups: Vec<u16> = Vec::with_capacity(ndigits as usize);
+    for _ in 0..ndigits {
+        groups.push(((read(i) * 10 + read(i + 1)) * 10 + read(i + 2)) * 10 + read(i + 3));
+        i += 4;
+    }
+
+    // `strip_var`: leading zero groups lower the weight, trailing zero
+    // groups drop, and the all-zero value normalizes sign and weight.
+    while groups.first() == Some(&0) {
+        groups.remove(0);
+        weight -= 1;
+    }
+    while groups.last() == Some(&0) {
+        groups.pop();
+    }
+    let sign = if groups.is_empty() {
+        NUMERIC_POS
+    } else if negative {
+        NUMERIC_NEG
+    } else {
+        NUMERIC_POS
+    };
+    let weight = if groups.is_empty() {
+        0
+    } else {
+        i16::try_from(weight).expect("checked above")
+    };
+    Ok(pack_numeric(weight, sign, dscale_u, &groups))
+}
+
+fn pack_numeric(weight: i16, sign: u16, dscale: u16, groups: &[u16]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 + groups.len() * 2);
+    out.extend_from_slice(&(groups.len() as i16).to_be_bytes());
+    out.extend_from_slice(&weight.to_be_bytes());
+    out.extend_from_slice(&sign.to_be_bytes());
+    out.extend_from_slice(&dscale.to_be_bytes());
+    for group in groups {
+        out.extend_from_slice(&group.to_be_bytes());
+    }
+    out
+}
+
 /// Renders the digit groups as exact decimal text in postgres
 /// `numeric_out` shape: plain notation with exactly `dscale` decimals
 /// when `dscale > 0` (the wire stores the display scale, so `1.5`
@@ -464,6 +618,130 @@ mod tests {
                 "truncated binary numeric value".into()
             ))
         );
+    }
+
+    #[test]
+    fn numeric_bind_encode_matches_the_wire_layout() {
+        // Every case mirrors `set_var_from_str`: the exact groups, weight
+        // and display scale the text path would produce (payloads are
+        // the same shapes the live server emitted in the decode probes).
+        let encode = |text: &str| {
+            let bytes = numeric_binary(text).expect("valid");
+            (0..usize::from(bytes[1]) * 2)
+                .step_by(2)
+                .map(|offset| u16::from_be_bytes([bytes[8 + offset], bytes[9 + offset]]))
+                .collect::<Vec<_>>()
+        };
+        let header = |text: &str| {
+            let bytes = numeric_binary(text).expect("valid");
+            (
+                i16::from_be_bytes([bytes[0], bytes[1]]),
+                i16::from_be_bytes([bytes[2], bytes[3]]),
+                u16::from_be_bytes([bytes[4], bytes[5]]),
+                u16::from_be_bytes([bytes[6], bytes[7]]),
+            )
+        };
+
+        assert_eq!(header("123.456"), (2, 0, 0x0000, 3));
+        assert_eq!(encode("123.456"), vec![123, 4560]);
+        assert_eq!(encode("1.5"), vec![1, 5000]);
+        // Display scale is wire data: "1.500" keeps trailing zeros.
+        assert_eq!(header("1.500"), (2, 0, 0x0000, 3));
+        assert_eq!(encode("1.500"), vec![1, 5000]);
+        // "0.005" — the leading zero group is stripped and weight drops.
+        assert_eq!(header("0.005"), (1, -1, 0x0000, 3));
+        assert_eq!(encode("0.005"), vec![50]);
+        assert_eq!(encode("1234"), vec![1234]);
+        // "15000" — the integer part spills into a second group.
+        assert_eq!(encode("15000"), vec![1, 5000]);
+        assert_eq!(encode("150"), vec![150]);
+        assert_eq!(encode(".5"), vec![5000]);
+        assert_eq!(header(".5"), (1, -1, 0x0000, 1));
+        // Negative sign only; digits stay unsigned.
+        assert_eq!(header("-150.5"), (2, 0, 0x4000, 1));
+        assert_eq!(encode("-150.5"), vec![150, 5000]);
+        // "-0.0" — strip_var normalizes the sign to POSITIVE; scale kept.
+        assert_eq!(header("-0.0"), (0, 0, 0x0000, 1));
+        assert!(encode("-0.0").is_empty(), "the zero value keeps no groups");
+        assert!(encode("0").is_empty(), "the zero value keeps no groups");
+        // Scientific text folds to the same internal layout.
+        assert_eq!(header("1e-7"), (1, -2, 0x0000, 7));
+        assert_eq!(encode("1e-7"), vec![10]);
+        assert_eq!(header("1e7"), (1, 1, 0x0000, 0));
+        assert_eq!(encode("1e7"), vec![1000]);
+        assert_eq!(encode("1.5e3"), vec![1500]);
+        // Specials keep the exact sign codes with no digits.
+        assert_eq!(
+            numeric_binary("NaN").as_deref(),
+            Ok(numeric_payload(0, 0xC000, 0, &[]).as_slice())
+        );
+        assert_eq!(
+            numeric_binary("Infinity").as_deref(),
+            Ok(numeric_payload(0, 0xD000, 0, &[]).as_slice())
+        );
+        assert_eq!(
+            numeric_binary("-Infinity").as_deref(),
+            Ok(numeric_payload(0, 0xF000, 0, &[]).as_slice())
+        );
+    }
+
+    #[test]
+    fn numeric_bind_encode_round_trips_through_the_decode_side() {
+        use oid::NUMERIC as N;
+        let round_trip = |text: &str, expected: &str| {
+            let bytes = numeric_binary(text).expect("valid");
+            assert_eq!(
+                binary_decode(N, &bytes),
+                Ok(Some(TypedValue::BigDecimal(expected.into())))
+            );
+        };
+        round_trip("123.456", "123.456");
+        round_trip("1.500", "1.500");
+        round_trip("0.005", "0.005");
+        round_trip("-150.5", "-150.5");
+        round_trip("-0.0", "0.0");
+        round_trip("0", "0");
+        round_trip(" 1e-7 ", "0.0000001");
+        round_trip("1.5e3", "1500");
+        round_trip("NaN", "NaN");
+        round_trip("Infinity", "Infinity");
+        round_trip("-Infinity", "-Infinity");
+        round_trip(
+            "99999999999999999999999999999999999999.99999999",
+            "99999999999999999999999999999999999999.99999999",
+        );
+        // The encode is the byte inverse of the decode test payload for
+        // the shared shapes.
+        assert_eq!(
+            numeric_binary("1.50003").as_deref(),
+            Ok(numeric_payload(0, 0x0000, 5, &[1, 5000, 3000]).as_slice())
+        );
+    }
+
+    #[test]
+    fn numeric_bind_encode_rejects_invalid_and_overflowing_text() {
+        for text in [
+            "", ";", "oops", "1..2", "1.5x", "5..", "1e", "1e5x", "-NaN", "+NaN", ".e3", "e5",
+        ] {
+            assert!(
+                numeric_binary(text).is_err(),
+                "'{text}' must be a named bind-time error"
+            );
+        }
+        for text in [
+            "1e99999999999", // exponent accumulation overflows first
+            "1e131076",      // weight leaves int16
+            "1e-99999",      // dscale leaves the 14-bit mask
+        ] {
+            assert!(
+                matches!(
+                    numeric_binary(text),
+                    Err(ConnectionError::Protocol(ref message))
+                        if message.contains("overflows the numeric wire format")
+                ),
+                "'{text}' must overflow"
+            );
+        }
     }
 
     #[test]

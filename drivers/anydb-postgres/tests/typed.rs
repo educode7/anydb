@@ -493,3 +493,75 @@ async fn typed_query_without_result_columns_skips_formats() {
     connection.terminate().await;
     server.await.expect("server task");
 }
+
+/// BigDecimal binds as declared `numeric` (binary format): the Parse
+/// declares OID 1700, the Bind carries the base-10000 external form and
+/// the echoed column decodes back to the same BigDecimal text.
+#[tokio::test]
+async fn typed_query_binds_big_decimal_as_numeric_binary() {
+    let (address, server) = spawn_backend(decimal_bind_cycle_server).await;
+    let mut connection = WireConnection::connect(&target(address))
+        .await
+        .expect("connect");
+
+    let result = connection
+        .typed_query(
+            "SELECT $1",
+            &[QueryParameter::BigDecimal("123.456".to_owned())],
+        )
+        .await
+        .expect("typed query");
+
+    assert_eq!(
+        result.columns,
+        vec![ColumnMeta {
+            name: "num".into(),
+            oid: types::oid::NUMERIC
+        }]
+    );
+    assert_eq!(
+        result.rows,
+        vec![vec![Some(TypedValue::BigDecimal("123.456".into()))]]
+    );
+
+    connection.terminate().await;
+    server.await.expect("server task");
+}
+
+async fn decimal_bind_cycle_server(mut stream: TcpStream) {
+    let len = stream.read_u32().await.expect("startup length");
+    let mut startup = vec![0u8; len as usize - 4];
+    stream.read_exact(&mut startup).await.expect("startup body");
+    authentication_ok(&mut stream).await;
+    ready_for_query(&mut stream).await;
+
+    // Describe phase: the BigDecimal parameter is declared numeric.
+    assert_parse(&mut stream, "SELECT $1", &[types::oid::NUMERIC]).await;
+    assert_eq!(expect_tag(&mut stream, b'D').await, vec![b'S', 0]);
+    assert!(expect_tag(&mut stream, b'H').await.is_empty());
+    send(&mut stream, b'1', &[]).await;
+    send(&mut stream, b't', &{
+        let mut payload = 1i16.to_be_bytes().to_vec();
+        payload.extend_from_slice(&types::oid::NUMERIC.to_be_bytes());
+        payload
+    })
+    .await;
+    send(
+        &mut stream,
+        b'T',
+        &row_description_typed(&[("num", types::oid::NUMERIC)]),
+    )
+    .await;
+
+    // Execution: the Bind value is exactly the external numeric form of
+    // 123.456 (the layout the live server produced in the smoke).
+    let echo = numeric_be(0, 3, &[123, 4560]);
+    assert_typed_bind(&mut stream, &[Some(&echo)], &[1]).await;
+    assert_execute_unlimited(&mut stream).await;
+    assert!(expect_tag(&mut stream, b'S').await.is_empty());
+
+    send(&mut stream, b'2', &[]).await;
+    send(&mut stream, b'D', &typed_data_row(&[Some(&echo)])).await;
+    send(&mut stream, b'C', b"SELECT 1\0").await;
+    ready_for_query(&mut stream).await;
+}

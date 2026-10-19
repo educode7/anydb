@@ -96,12 +96,13 @@ const OID_INT8: i32 = 20;
 const OID_BYTEA: i32 = 17;
 const OID_TEXT: i32 = 25;
 const OID_FLOAT8: i32 = 701;
+const OID_NUMERIC: i32 = 1700;
 
 /// Declared type OID for one SPI parameter (`0` = unknown: only NULL uses
 /// this, letting the server infer the type from the statement context).
-/// `BigDecimal` is refused: exact decimal binding to postgres `numeric`
-/// (the base-10000 binary encode) is not wired in this driver yet, and
-/// the refusal is named instead of an accidental text coercion.
+/// `BigDecimal` declares postgres `numeric` and binds the base-10000
+/// external binary form (`types::numeric_binary`); invalid decimal text
+/// fails before any wire byte is written.
 fn param_type_oid(param: &QueryParameter) -> Result<i32, ConnectionError> {
     match param {
         QueryParameter::Null => Ok(0),
@@ -110,9 +111,7 @@ fn param_type_oid(param: &QueryParameter) -> Result<i32, ConnectionError> {
         QueryParameter::Float(_) => Ok(OID_FLOAT8),
         QueryParameter::Text(_) => Ok(OID_TEXT),
         QueryParameter::Binary(_) => Ok(OID_BYTEA),
-        QueryParameter::BigDecimal(_) => Err(ConnectionError::Protocol(
-            "binding 'BigDecimal' parameters is refused on this driver yet".to_owned(),
-        )),
+        QueryParameter::BigDecimal(_) => Ok(OID_NUMERIC),
     }
 }
 
@@ -127,9 +126,7 @@ fn param_binary(param: &QueryParameter) -> Result<Option<Vec<u8>>, ConnectionErr
         QueryParameter::Float(value) => Ok(Some(value.to_be_bytes().to_vec())),
         QueryParameter::Text(value) => Ok(Some(value.clone().into_bytes())),
         QueryParameter::Binary(value) => Ok(Some(value.clone())),
-        QueryParameter::BigDecimal(_) => Err(ConnectionError::Protocol(
-            "binding 'BigDecimal' parameters is refused on this driver yet".to_owned(),
-        )),
+        QueryParameter::BigDecimal(text) => types::numeric_binary(text).map(Some),
     }
 }
 
@@ -1736,15 +1733,21 @@ mod statement_cache_tests {
     use super::*;
 
     #[test]
-    fn big_decimal_binding_is_a_named_refusal() {
+    fn big_decimal_binds_the_numeric_oid_wires_the_binary_form() {
         use anydb_shared::driver::statement::QueryParameter;
-        let refused = param_type_oid(&QueryParameter::BigDecimal("1.5".to_owned()));
-        assert!(matches!(
-            refused,
-            Err(ConnectionError::Protocol(ref message)) if message.contains("refused")
-        ));
-        let bytes = param_binary(&QueryParameter::BigDecimal("1.5".to_owned()));
-        assert!(bytes.is_err(), "no silent text coercion");
+        let oid = param_type_oid(&QueryParameter::BigDecimal("1.5".to_owned()));
+        assert_eq!(oid, Ok(1700), "declares numeric, no text coercion");
+        // `SELECT $1` with `BigDecimal("1.5")`: numeric external binary
+        // (ndigits, weight, sign, dscale, base-10000 groups per 1.5).
+        let bytes = param_binary(&QueryParameter::BigDecimal("1.5".to_owned())).expect("valid");
+        assert_eq!(
+            bytes,
+            Some(vec![
+                0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x13, 0x88
+            ])
+        );
+        let invalid = param_binary(&QueryParameter::BigDecimal("1.5x".to_owned()));
+        assert!(invalid.is_err(), "bind-time protocol error, pre-wire");
     }
 
     fn prepared(sql: &str) -> Prepared {
