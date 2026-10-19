@@ -357,3 +357,103 @@ async fn describe_error_recovers_for_the_next_page() {
     connection.terminate().await;
     server.await.expect("server task");
 }
+
+/// A mid-batch error on a CONTINUE aborts the implicit transaction,
+/// which destroys the suspended portal: the next continue fails
+/// locally, and a fresh paging start runs the complete flow on the
+/// same connection.
+async fn mid_batch_error_disposal_server(mut stream: TcpStream) {
+    let len = stream.read_u32().await.expect("startup length");
+    let mut startup = vec![0u8; len as usize - 4];
+    stream.read_exact(&mut startup).await.expect("startup body");
+    authentication_ok(&mut stream).await;
+    ready_for_query(&mut stream).await;
+
+    // Cycle 1: batch one suspends, the continuation fails mid-batch.
+    assert_parse_unnamed(&mut stream, "SELECT g").await;
+    assert_describe_statement_unnamed(&mut stream).await;
+    assert!(expect_tag(&mut stream, b'H').await.is_empty());
+    send(&mut stream, b'1', &[]).await;
+    send(&mut stream, b't', &0i16.to_be_bytes()).await;
+    send(&mut stream, b'T', &row_description_int8()).await;
+    assert_paged_bind(&mut stream).await;
+    assert_execute_limit(&mut stream, 1).await;
+    assert!(expect_tag(&mut stream, b'H').await.is_empty());
+    send(&mut stream, b'2', &[]).await;
+    send(&mut stream, b'D', &typed_data_row_int8(0)).await;
+    send(&mut stream, b's', &[]).await; // PortalSuspended.
+
+    // The suspended portal is re-executed; the next row fails.
+    assert_execute_limit(&mut stream, 1).await;
+    assert!(expect_tag(&mut stream, b'H').await.is_empty());
+    send(&mut stream, b'D', &typed_data_row_int8(1)).await;
+    send(
+        &mut stream,
+        b'E',
+        &error_payload("22P02", "invalid input syntax at row three"),
+    )
+    .await;
+    // The driver closes the aborted implicit transaction with Sync.
+    assert_sync(&mut stream).await;
+    send(&mut stream, b'Z', b"I").await;
+
+    // Cycle 2: a fresh paging start runs the complete flow (no stale
+    // Execute may appear between the two cycles).
+    assert_parse_unnamed(&mut stream, "SELECT g").await;
+    assert_describe_statement_unnamed(&mut stream).await;
+    assert!(expect_tag(&mut stream, b'H').await.is_empty());
+    send(&mut stream, b'1', &[]).await;
+    send(&mut stream, b't', &0i16.to_be_bytes()).await;
+    send(&mut stream, b'T', &row_description_int8()).await;
+    assert_paged_bind(&mut stream).await;
+    assert_execute_limit(&mut stream, 1).await;
+    assert!(expect_tag(&mut stream, b'H').await.is_empty());
+    send(&mut stream, b'2', &[]).await;
+    send(&mut stream, b'D', &typed_data_row_int8(9)).await;
+    send(&mut stream, b'C', b"SELECT 1\0").await;
+    assert_sync(&mut stream).await;
+    send(&mut stream, b'Z', b"I").await;
+}
+
+#[tokio::test]
+async fn mid_batch_error_disposes_the_portal_state() {
+    let (address, server) = spawn_backend(mid_batch_error_disposal_server).await;
+    let mut connection = WireConnection::connect(&target(address))
+        .await
+        .expect("connect");
+
+    let first = connection
+        .query_page_start("SELECT g", &[], 1)
+        .await
+        .expect("first batch");
+    assert!(first.suspended);
+    assert_eq!(first.result.rows, vec![vec![Some(TypedValue::Int8(0))]]);
+
+    let failed = connection
+        .query_page_continue(1)
+        .await
+        .expect_err("mid-batch error");
+    assert!(matches!(failed, ConnectionError::ExecutionFailed { .. }));
+
+    // The aborted transaction destroyed the portal: continuing fails
+    // locally, with no wire traffic (the fake reaches cycle 2 directly).
+    let stale = connection
+        .query_page_continue(1)
+        .await
+        .expect_err("no portal may survive the aborted transaction");
+    assert!(matches!(
+        stale,
+        ConnectionError::Protocol(message) if message == "no suspended portal"
+    ));
+
+    // Recovery: a fresh page start completes on the same connection.
+    let recovered = connection
+        .query_page_start("SELECT g", &[], 1)
+        .await
+        .expect("recovery page");
+    assert!(!recovered.suspended);
+    assert_eq!(recovered.result.rows, vec![vec![Some(TypedValue::Int8(9))]]);
+
+    connection.terminate().await;
+    server.await.expect("server task");
+}

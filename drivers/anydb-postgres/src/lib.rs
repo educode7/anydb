@@ -116,6 +116,14 @@ impl WireDataSource {
     /// `fetchSize` streaming analog). Driver-level on purpose: portal
     /// paging spans multiple round trips on a half-open implicit
     /// transaction, which does not fit the one-shot recovery pipeline.
+    ///
+    /// Live semantics: with `limit` EQUAL to the remaining rows the
+    /// server still suspends (the next continuation contributes zero
+    /// rows with the closing tag); a one-shot statement on the same
+    /// source abandons the half-open page (its `Sync` ends the implicit
+    /// transaction and the local state refuses cleanly afterwards); a
+    /// mid-batch error disposes the portal state, and a fresh start
+    /// recovers on the same connection.
     pub async fn query_page_start(
         &self,
         sql: &str,

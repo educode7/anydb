@@ -1043,6 +1043,11 @@ impl Connection {
         sql: &str,
         params: &[QueryParameter],
     ) -> Result<ExtendedResult, ConnectionError> {
+        // A one-shot cycle carries its own `Sync`, which ends the
+        // implicit transaction and destroys any half-open suspended
+        // portal: the local paging state dies with it (abandon on new
+        // statement, same as a fresh `query_page_start`).
+        self.paged_portal = None;
         // Parse: [name\0][sql\0][i16 param count][i32 oid per param].
         write_message(
             &mut self.stream,
@@ -1136,6 +1141,11 @@ impl Connection {
         sql: &str,
         params: &[QueryParameter],
     ) -> Result<TypedResult, ConnectionError> {
+        // A one-shot cycle carries its own `Sync`, which ends the
+        // implicit transaction and destroys any half-open suspended
+        // portal: the local paging state dies with it (abandon on new
+        // statement, same as a fresh `query_page_start`).
+        self.paged_portal = None;
         write_message(
             &mut self.stream,
             b'P',
@@ -1348,6 +1358,11 @@ impl Connection {
         prepared: &Prepared,
         params: &[QueryParameter],
     ) -> Result<TypedResult, ConnectionError> {
+        // A one-shot cycle carries its own `Sync`, which ends the
+        // implicit transaction and destroys any half-open suspended
+        // portal: the local paging state dies with it (abandon on new
+        // statement, same as a fresh `query_page_start`).
+        self.paged_portal = None;
         write_message(
             &mut self.stream,
             b'B',
@@ -1435,7 +1450,12 @@ impl Connection {
 
     /// Writes `Sync` and drains until `ReadyForQuery`, capturing the
     /// transaction status so the connection stays reusable.
+    /// Sends `Sync` and drains until `ReadyForQuery`. Every `Sync` ends
+    /// the implicit transaction, so the suspended-portal state cannot
+    /// survive it: a mid-batch error, a page-abandon close, and the
+    /// final batch all dispose of the paging state here.
     async fn write_sync_and_drain(&mut self) -> Result<(), ConnectionError> {
+        self.paged_portal = None;
         write_message(&mut self.stream, b'S', &[]).await?;
         loop {
             let (tag, payload) = read_message(&mut self.stream).await?;
