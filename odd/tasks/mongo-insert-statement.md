@@ -2,8 +2,9 @@
 
 Objective: give `anydb-mongo` a write statement (`insert <collection> with <json-document>`) and use
 the existing anydb connection to seed the VUCE landing data into docker mongo.
-Branch: `feature/mongo-insert-statement` (from `main` @ 14ee025). Delivery strategy: `ask-on-risk`
-(resolve before the first commit that passes ~400 authored lines). Test runner: `cargo test --workspace`
+Branch: `feature/mongo-insert-statement` (from `main` @ 14ee025). Delivery strategy: `ask-on-risk`,
+resolved by the user at delivery to **stacked work-unit commits on the branch** (no pull requests;
+push stays a human decision). Test runner: `cargo test --workspace`
 + gates `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo deny check`.
 
 ## Specs
@@ -89,11 +90,11 @@ The consumer (`auth-landing-componentes-api`) reads with `findByIsActiveEquals("
 
 | ID | Spec | Route | Status | Evidence |
 | --- | --- | --- | --- | --- |
-| T1 | S1 | inline | done | RED: new tests fail to compile + `insert_statements_parse_their_collection` fails; GREEN: 28 `document` tests pass |
-| T2 | S2 | inline | done | RED: `insert_statement_ships_the_parsed_document` + `insert_write_errors_stay_errors` fail; GREEN: fake mongod asserts `{insert, documents, $db}` and the `E11000` reply surfaces |
-| T3 | S3 | inline | done | RED: `insert_failures_never_reach_the_wire` + `paging_rejects_insert_statements` fail; GREEN: dispatch + `"cursor paging requires a find statement"` |
-| T4 | S4, S5, S6 | inline | done | `group-1/2/3.json` from `transform.mjs` (assertions pass); live `seed_landing` run: `insert 1` ×3, `find 3`, census `AUTH1_AUTH2=2 AUTH2=2 AUTH1=19` |
-| T5 | all | inline | done | `cargo fmt --check` ok, `clippy --workspace --all-targets -D warnings` ok, `cargo test --workspace` ok (23 targets), `cargo deny check` ok |
+| T1 | S1 | inline | done | RED: new tests fail to compile + `insert_statements_parse_their_collection` fails; GREEN: 28 `document` tests pass — commit `9d80eb1` |
+| T2 | S2 | inline | done | RED: `insert_statement_ships_the_parsed_document` + `insert_write_errors_stay_errors` fail; GREEN: fake mongod asserts `{insert, documents, $db}` and the `E11000` reply surfaces — commit `9d80eb1` |
+| T3 | S3 | inline | done | RED: `insert_failures_never_reach_the_wire` + `paging_rejects_insert_statements` fail; GREEN: dispatch + `"cursor paging requires a find statement"` — commit `9d80eb1` |
+| T4 | S4, S5, S6 | inline | done | `group-1/2/3.json` from `transform.mjs` (assertions pass); live `seed_landing` run: `insert 1` ×3, `find 3`, census `AUTH1_AUTH2=2 AUTH2=2 AUTH1=19` — commits `136a18e` (data) + `d7f70e3` (example) |
+| T5 | all | inline | done | `cargo fmt --check` ok, `clippy --workspace --all-targets -D warnings` ok, `cargo test --workspace` ok (23 targets), `cargo deny check` ok — verified on the state held by `d7f70e3` |
 
 ## Log
 
@@ -144,3 +145,17 @@ The consumer (`auth-landing-componentes-api`) reads with `findByIsActiveEquals("
   -D warnings`, `cargo test --workspace` (exit 0, 23 targets), `cargo deny check` (advisories, bans,
   licenses, sources ok). Nothing committed yet: ~1.4k authored lines exceed the ~400-line delivery
   heuristic, so the chain strategy is resolved with the user before the first commit.
+- L10 (2026-10-19, delivery): strategy asked and answered verbatim — "Commits apilados en la rama"
+  (stacked work-unit commits on the branch, no pull requests, push a human decision). The ~400-line
+  heuristic was exceeded by the insert vertical (986 insertions: grammar, dispatch and wire are one
+  behavior — splitting them yields commits that do not compile) and by the seed (502 data + 266
+  example). Branch commits, oldest first:
+  - `1fc6a34` refactor(anydb-mongo): share number literal shaping between filters and documents
+  - `9d80eb1` feat(anydb-mongo): add insert statement with a JSON document payload
+  - `136a18e` chore(anydb-mongo): add the VUCE landing seed data
+  - `d7f70e3` feat(anydb-mongo): add the seed_landing example
+  - `06d52b8` docs: add the ODD feature document for the mongo insert statement
+
+  `1fc6a34` was verified in isolation (everything else stashed, then `cargo test -p anydb-mongo`:
+  64 lib + 31 integration tests, exit 0); from `9d80eb1` on, `src/` and `tests/` are byte-identical
+  to the state the workspace gates ran green on. Working tree clean at `06d52b8`.
