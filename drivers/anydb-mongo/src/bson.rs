@@ -411,6 +411,104 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
+// ---------- encoding (wire commands) ----------
+
+/// Encodes one self-delimiting BSON document: little-endian length
+/// prefix, fields, terminator. The inverse of `parse_document`, used to
+/// build outgoing OP_MSG command bodies.
+///
+/// Key rules: keys must be non-empty and free of NUL bytes (a BSON body
+/// is NUL-terminated per key). Opaque raw bytes (`timestamp` /
+/// `decimal128`) encode as binary subtype 0x00 — opaque values never
+/// leave as anything else on the wire surface this driver produces.
+pub fn encode_document(document: &Document) -> Result<Vec<u8>, ConnectionError> {
+    let mut fields = Vec::new();
+    write_fields(document, &mut fields)?;
+    let total = 4usize
+        .checked_add(fields.len())
+        .ok_or_else(|| protocol("document too large".to_owned()))?;
+    i32::try_from(total).map_err(|_| protocol("document too large".to_owned()))?;
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(&(total as i32).to_le_bytes());
+    out.extend_from_slice(&fields);
+    Ok(out)
+}
+
+fn write_fields(document: &Document, out: &mut Vec<u8>) -> Result<(), ConnectionError> {
+    for (key, value) in document {
+        if key.is_empty() {
+            return Err(protocol("empty field key".to_owned()));
+        }
+        if key.bytes().any(|byte| byte == 0) {
+            return Err(protocol("field key contains a NUL byte".to_owned()));
+        }
+        let type_code = match value {
+            Bson::Double(_) => 0x01,
+            Bson::String(_) => 0x02,
+            Bson::Document(_) => 0x03,
+            Bson::Array(_) => 0x04,
+            Bson::Binary(_) | Bson::Opaque(_) => 0x05,
+            Bson::ObjectId(_) => 0x07,
+            Bson::Boolean(_) => 0x08,
+            Bson::DateTime(_) => 0x09,
+            Bson::Null => 0x0A,
+            Bson::Int32(_) => 0x10,
+            Bson::Int64(_) => 0x12,
+        };
+        out.push(type_code);
+        out.extend_from_slice(key.as_bytes());
+        out.push(0);
+        write_value(value, out)?;
+    }
+    out.push(0);
+    Ok(())
+}
+
+fn write_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), ConnectionError> {
+    let length = i32::try_from(bytes.len()).map_err(|_| protocol("binary too large".to_owned()))?;
+    out.extend_from_slice(&length.to_le_bytes());
+    out.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn write_string(text: &str, out: &mut Vec<u8>) -> Result<(), ConnectionError> {
+    let mut body = text.as_bytes().to_vec();
+    body.push(0);
+    write_bytes(out, &body)?;
+    Ok(())
+}
+
+fn write_value(value: &Bson, out: &mut Vec<u8>) -> Result<(), ConnectionError> {
+    match value {
+        Bson::Double(number) => out.extend_from_slice(&number.to_le_bytes()),
+        Bson::String(text) => write_string(text, out)?,
+        Bson::Document(nested) => out.extend_from_slice(&encode_document(nested)?),
+        Bson::Array(values) => {
+            // BSON arrays are documents whose keys are the indexes.
+            let indexed: Document = values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| (index.to_string(), value.clone()))
+                .collect();
+            out.extend_from_slice(&encode_document(&indexed)?);
+        }
+        Bson::Binary(bytes) | Bson::Opaque(bytes) => {
+            let length =
+                i32::try_from(bytes.len()).map_err(|_| protocol("binary too large".to_owned()))?;
+            out.extend_from_slice(&length.to_le_bytes());
+            out.push(0x00);
+            out.extend_from_slice(bytes);
+        }
+        Bson::ObjectId(bytes) => out.extend_from_slice(bytes),
+        Bson::Boolean(value) => out.push(u8::from(*value)),
+        Bson::DateTime(millis) => out.extend_from_slice(&millis.to_le_bytes()),
+        Bson::Null => {}
+        Bson::Int32(number) => out.extend_from_slice(&number.to_le_bytes()),
+        Bson::Int64(number) => out.extend_from_slice(&number.to_le_bytes()),
+    }
+    Ok(())
+}
+
 // ---------- test helpers (build raw BSON little-endian) ----------
 
 #[cfg(test)]
@@ -700,5 +798,85 @@ mod tests {
         assert_eq!(iso8601(-86_400_000), "1969-12-31T00:00:00.000Z");
         // Leap-era edge: 2000-02-29 exists (951782400 s = 2000-02-29T00Z).
         assert_eq!(iso8601(951_782_400_000), "2000-02-29T00:00:00.000Z");
+    }
+
+    #[test]
+    fn encoding_round_trips_through_the_parser() {
+        let document = Document::from(vec![
+            ("d".to_owned(), Bson::Double(3.5)),
+            ("s".to_owned(), Bson::String("hola".to_owned())),
+            (
+                "n".to_owned(),
+                Bson::Document(Document::from(vec![("x".to_owned(), Bson::Int32(7))])),
+            ),
+            (
+                "a".to_owned(),
+                Bson::Array(vec![Bson::Int32(1), Bson::Int64(2)]),
+            ),
+            ("b".to_owned(), Bson::Binary(vec![0xCA, 0xFE])),
+            (
+                "o".to_owned(),
+                Bson::ObjectId([1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]),
+            ),
+            ("t".to_owned(), Bson::Boolean(true)),
+            ("m".to_owned(), Bson::Int64(9000)),
+            ("c".to_owned(), Bson::Int32(42)),
+            ("z".to_owned(), Bson::Null),
+            ("w".to_owned(), Bson::DateTime(1_735_689_600_000)),
+        ]);
+        let encoded = encode_document(&document).expect("encode");
+        assert_eq!(parse_document(&encoded).expect("reparsed"), document);
+        // The length prefix equals the encoded size exactly.
+        let declared = i32::from_le_bytes(encoded[0..4].try_into().expect("4 bytes"));
+        assert_eq!(declared as usize, encoded.len());
+    }
+
+    #[test]
+    fn empty_and_nested_documents_encode_canonically() {
+        let encoded = encode_document(&Document::new()).expect("encode");
+        assert_eq!(encoded, vec![5, 0, 0, 0, 0]);
+        let nested = Document::from(vec![("in".to_owned(), Bson::Document(Document::new()))]);
+        let encoded = encode_document(&nested).expect("encode");
+        assert_eq!(parse_document(&encoded).expect("reparsed"), nested);
+    }
+
+    #[test]
+    fn encoding_refuses_invalid_and_oversized_keys() {
+        assert!(matches!(
+            encode_document(&Document::from(vec![("".to_owned(), Bson::Int32(1))])),
+            Err(ConnectionError::Protocol(message)) if message.contains("empty")
+        ));
+        assert!(matches!(
+            encode_document(&Document::from(vec![("a\0".to_owned(), Bson::Int32(1))])),
+            Err(ConnectionError::Protocol(message)) if message.contains("NUL")
+        ));
+    }
+
+    #[test]
+    fn binary_values_lock_the_wire_layout() {
+        let encoded = encode_document(&Document::from(vec![(
+            "b".to_owned(),
+            Bson::Binary(vec![0xCA, 0xFE]),
+        )]))
+        .expect("encode");
+        assert_eq!(
+            encoded,
+            vec![15, 0, 0, 0, 0x05, b'b', 0, 2, 0, 0, 0, 0x00, 0xCA, 0xFE, 0],
+            "BSON binary layout: [len LE][subtype][payload]"
+        );
+    }
+
+    #[test]
+    fn arrays_encode_as_index_key_documents() {
+        let encoded = encode_document(&Document::from(vec![(
+            "a".to_owned(),
+            Bson::Array(vec![Bson::Int32(1), Bson::Int32(2)]),
+        )]))
+        .expect("encode");
+        let document = parse_document(&encoded).expect("reparsed");
+        match &document[0].1 {
+            Bson::Array(values) => assert_eq!(values, &vec![Bson::Int32(1), Bson::Int32(2)]),
+            other => panic!("expected array, got {other:?}"),
+        }
     }
 }

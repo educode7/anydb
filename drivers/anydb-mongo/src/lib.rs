@@ -1,19 +1,37 @@
 #![forbid(unsafe_code)]
-//! MongoDB driver skeleton: same contract as `anydb-postgres`; declared
-//! thread-safe is `false` on purpose so the serialized statement gate path
-//! (`SingleThreadLock` analog) is exercised from day one. The `bson`
-//! module carries the typed-mapping foundation (parser + `TypedValue`
-//! rules) for the future wire layer.
+//! MongoDB driver over the OP_MSG wire protocol (this vertical replaces
+//! the query-only skeleton): `hello` handshake with
+//! `saslSupportedMechs` negotiation, SCRAM-SHA-1/256 authentication and
+//! typed mapping through the `bson` module (the DBeaver
+//! `DocumentValueExtractor` analog). Declared thread-safe is `false` on
+//! purpose so the serialized statement gate path (`SingleThreadLock`
+//! analog) is exercised from day one.
+//!
+//! Statement surface: `"find <collection>"` executed as a single-batch
+//! `find` command (`singleBatch: true`, cursor closed). Parameters are
+//! not supported yet (a filter document language is future work); the
+//! typed mapping converts every BSON value through the shared
+//! `TypedValue` contract, with extended-JSON rendering for embedded
+//! documents and ISO-8601 text for UTC datetimes.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use tokio::sync::Mutex as AsyncMutex;
 
 pub mod bson;
+mod op_msg;
+mod scram;
+pub mod uri;
+mod wire;
 
 use anydb_shared::ConnectionError;
 use anydb_shared::driver::descriptor::DriverDescriptor;
 use anydb_shared::driver::spi::{DataSource, DataSourceMetadata, Driver, OpenRequest};
+use anydb_shared::driver::statement::{QueryParameter, StatementResult, TypedStatementResult};
+
+use crate::uri::MongoTarget;
+use crate::wire::Connection as WireConnection;
 
 #[derive(Debug)]
 pub struct MongoDriver {
@@ -32,25 +50,178 @@ impl MongoDriver {
             descriptor: DriverDescriptor::new("mongodb", "MongoDB", false),
         }
     }
+
+    /// Typed factory for callers that want the concrete wire data source.
+    pub async fn open_wire_data_source(
+        &self,
+        request: OpenRequest,
+    ) -> Result<Arc<WireDataSource>, ConnectionError> {
+        let target = resolve_target(&request)?;
+        let connection = WireConnection::connect(&target).await?;
+        let metadata = DataSourceMetadata {
+            product_name: "MongoDB".to_owned(),
+            product_version: connection.server_version().to_owned(),
+            driver_name: "anydb-mongo".to_owned(),
+        };
+        Ok(Arc::new(WireDataSource {
+            connection: AsyncMutex::new(Some(connection)),
+            metadata,
+        }))
+    }
 }
 
-struct WirePendingDataSource;
+/// URL credentials win the user slot (properties only fill a missing
+/// user); `password` and `auth_source` are property-overridable
+/// (the secrets pipeline writes there).
+fn resolve_target(request: &OpenRequest) -> Result<MongoTarget, ConnectionError> {
+    let user = request.properties.get("user").map(String::as_str);
+    let mut target = uri::parse_target(&request.target, user)?;
+    if let Some(value) = request.properties.get("password") {
+        target.password = Some(value.clone());
+    }
+    if let Some(value) = request.properties.get("auth_source")
+        && !value.is_empty()
+    {
+        target.auth_db = value.clone();
+    }
+    Ok(target)
+}
+
+/// The only statement form this vertical supports: `find <collection>`
+/// (single token, no whitespace).
+fn parse_find_statement(sql: &str) -> Result<String, ConnectionError> {
+    fn protocol(message: String) -> ConnectionError {
+        ConnectionError::Protocol(format!("unsupported statement: {message}"))
+    }
+    let mut tokens = sql.split_whitespace();
+    let (Some(command), Some(collection)) = (tokens.next(), tokens.next()) else {
+        return Err(protocol(
+            "mongo statements are 'find <collection>'".to_owned(),
+        ));
+    };
+    if command != "find" {
+        return Err(protocol(
+            "mongo statements are 'find <collection>'".to_owned(),
+        ));
+    }
+    if tokens.next().is_some() {
+        return Err(protocol(
+            "mongo statements are 'find <collection>' (one trailing token)".to_owned(),
+        ));
+    }
+    if collection.starts_with('$') {
+        return Err(protocol(
+            "collection names may not start with '$'".to_owned(),
+        ));
+    }
+    Ok(collection.to_owned())
+}
+
+/// Live data source over exactly one wire connection; commands serialize
+/// behind a tokio mutex (`None` after close).
+#[derive(Debug)]
+pub struct WireDataSource {
+    connection: AsyncMutex<Option<WireConnection>>,
+    metadata: DataSourceMetadata,
+}
+
+impl WireDataSource {
+    /// Driver-level factory for direct wire tests (no lifecycle
+    /// pipeline involved).
+    pub async fn open(target: &MongoTarget) -> Result<Arc<Self>, ConnectionError> {
+        let connection = WireConnection::connect(target).await?;
+        let metadata = DataSourceMetadata {
+            product_name: "MongoDB".to_owned(),
+            product_version: connection.server_version().to_owned(),
+            driver_name: "anydb-mongo".to_owned(),
+        };
+        Ok(Arc::new(Self {
+            connection: AsyncMutex::new(Some(connection)),
+            metadata,
+        }))
+    }
+
+    /// Typed core shared by both SPI surfaces.
+    async fn find_typed(
+        &self,
+        collection: String,
+    ) -> Result<TypedStatementResult, ConnectionError> {
+        let mut guard = self.connection.lock().await;
+        let Some(connection) = guard.as_mut() else {
+            return Err(ConnectionError::DriverFailure);
+        };
+        let documents = connection.find(&collection).await?;
+        let affected =
+            i64::try_from(documents.len()).map_err(|_| ConnectionError::DriverFailure)?;
+        Ok(bson::documents_to_result(
+            &documents,
+            Some(&format!("find {affected}")),
+            Some(affected),
+        ))
+    }
+}
 
 #[async_trait]
-impl DataSource for WirePendingDataSource {
+impl DataSource for WireDataSource {
     fn metadata(&self) -> DataSourceMetadata {
-        DataSourceMetadata {
-            product_name: "MongoDB".to_owned(),
-            product_version: "unknown".to_owned(),
-            driver_name: "anydb-mongo".to_owned(),
+        self.metadata.clone()
+    }
+
+    /// Keepalive ping command (`{ping: 1}`).
+    async fn ping(&self) -> Result<(), ConnectionError> {
+        let mut guard = self.connection.lock().await;
+        let Some(connection) = guard.as_mut() else {
+            return Err(ConnectionError::DriverFailure);
+        };
+        connection.ping().await
+    }
+
+    /// Text surface over the typed core: every value renders through
+    /// the platform-friendly `TypedValue` display.
+    async fn execute_statement(
+        &self,
+        sql: &str,
+        params: &[QueryParameter],
+    ) -> Result<StatementResult, ConnectionError> {
+        let typed = DataSource::execute_statement_typed(self, sql, params).await?;
+        Ok(StatementResult {
+            columns: typed.columns,
+            rows: typed
+                .rows
+                .into_iter()
+                .map(|row| {
+                    row.into_iter()
+                        .map(|cell| cell.map(|value| value.to_string()))
+                        .collect()
+                })
+                .collect(),
+            command_tag: typed.command_tag,
+            affected_rows: typed.affected_rows,
+        })
+    }
+
+    /// Typed execution: the shared `TypedValue` contract applied to
+    /// every BSON value (embedded documents as extended JSON, datetimes
+    /// as ISO-8601 text).
+    async fn execute_statement_typed(
+        &self,
+        sql: &str,
+        params: &[QueryParameter],
+    ) -> Result<TypedStatementResult, ConnectionError> {
+        if !params.is_empty() {
+            return Err(ConnectionError::Protocol(
+                "'find <collection>' statements take no parameters yet".to_owned(),
+            ));
+        }
+        let collection = parse_find_statement(sql)?;
+        self.find_typed(collection).await
+    }
+
+    async fn close(&self) {
+        if let Some(connection) = self.connection.lock().await.take() {
+            connection.terminate().await;
         }
     }
-
-    async fn ping(&self) -> Result<(), ConnectionError> {
-        Ok(())
-    }
-
-    async fn close(&self) {}
 }
 
 #[async_trait]
@@ -63,16 +234,15 @@ impl Driver for MongoDriver {
         &self,
         request: OpenRequest,
     ) -> Result<Arc<dyn DataSource>, ConnectionError> {
-        if request.target.is_empty() {
-            return Err(ConnectionError::DriverFailure);
-        }
-        Ok(Arc::new(WirePendingDataSource))
+        Ok(self.open_wire_data_source(request).await?)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::collections::HashMap;
 
     #[test]
     fn driver_is_declared_not_thread_safe() {
@@ -81,47 +251,74 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_returns_metadata_source() {
+    async fn open_requires_resolved_target() {
         let driver = MongoDriver::new();
         let request = OpenRequest {
             container_id: "c1".into(),
-            target: "mongodb://host".into(),
+            target: String::new(),
             properties: Default::default(),
         };
-        let source = driver.open_data_source(request).await.unwrap();
-        assert_eq!(source.metadata().driver_name, "anydb-mongo");
-        source.close().await;
+        assert!(driver.open_data_source(request).await.is_err());
     }
 
     #[tokio::test]
-    async fn statement_execution_falls_back_to_the_default_error() {
+    async fn open_requires_host_after_scheme() {
         let driver = MongoDriver::new();
         let request = OpenRequest {
             container_id: "c1".into(),
-            target: "mongodb://host".into(),
+            target: "mongodb:///shop".into(),
             properties: Default::default(),
         };
-        let source = driver.open_data_source(request).await.unwrap();
-        let error = source
-            .execute_statement("find {}", &[])
-            .await
-            .expect_err("query-only driver must not execute statements");
-        assert_eq!(error, ConnectionError::DriverFailure);
+        match driver.open_data_source(request).await {
+            Ok(_) => panic!("missing host must fail"),
+            Err(error) => assert!(matches!(error, ConnectionError::Protocol(_))),
+        }
     }
 
-    #[tokio::test]
-    async fn cached_statement_execution_degrades_to_plain_typed() {
-        let driver = MongoDriver::new();
+    #[test]
+    fn find_statements_parse_their_collection() {
+        assert_eq!(
+            parse_find_statement("find orders").expect("parsed"),
+            "orders"
+        );
+        assert_eq!(
+            parse_find_statement("  find  system.users  ").expect("parsed"),
+            "system.users"
+        );
+        assert!(parse_find_statement("").is_err());
+        assert!(parse_find_statement("find").is_err());
+        assert!(parse_find_statement("drop db").is_err());
+        assert!(parse_find_statement("find db extra").is_err());
+        assert!(parse_find_statement("find $cmd").is_err());
+    }
+
+    #[test]
+    fn resolve_target_prefers_properties_over_url_credentials() {
         let request = OpenRequest {
             container_id: "c1".into(),
-            target: "mongodb://host".into(),
-            properties: Default::default(),
+            target: "mongodb://urluser:urlpass@host:1/urlauth".into(),
+            properties: HashMap::from([
+                ("user".to_owned(), "puser".to_owned()),
+                ("password".to_owned(), "ppass".to_owned()),
+                ("auth_source".to_owned(), "pauth".to_owned()),
+            ]),
         };
-        let source = driver.open_data_source(request).await.unwrap();
-        let error = source
-            .execute_cached_statement_typed("find {}", &[])
-            .await
-            .expect_err("cache-less drivers must not execute statements");
-        assert_eq!(error, ConnectionError::DriverFailure);
+        let target = resolve_target(&request).expect("resolved");
+        assert_eq!(target.user.as_deref(), Some("urluser"));
+        assert_eq!(target.password.as_deref(), Some("ppass"));
+        assert_eq!(target.auth_db, "pauth");
+    }
+
+    #[test]
+    fn resolve_target_falls_back_to_url_credentials() {
+        let request = OpenRequest {
+            container_id: "c1".into(),
+            target: "mongodb://urluser@host:1".into(),
+            properties: HashMap::new(),
+        };
+        let target = resolve_target(&request).expect("resolved");
+        assert_eq!(target.user.as_deref(), Some("urluser"));
+        assert_eq!(target.password, None);
+        assert_eq!(target.auth_db, "admin");
     }
 }
