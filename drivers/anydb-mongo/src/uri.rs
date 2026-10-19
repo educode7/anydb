@@ -5,9 +5,10 @@
 //! database): every `%` must be followed by two hex digits and the
 //! result must be valid UTF-8; error messages name the context but
 //! never the decoded value. Query options (`?tls=...`) are ignored on
-//! purpose: TLS and other options are future wire work (see module doc
-//! of `wire`). `mongodb+srv://` and multi-host seeds are explicit
-//! `Protocol` errors, never silently narrowed.
+//! purpose: TLS comes from the `ssl_mode` / `ssl_root_cert` resolved
+//! properties, not the connection string. `mongodb+srv://` and
+//! multi-host seeds are explicit `Protocol` errors, never silently
+//! narrowed.
 
 use std::borrow::Cow;
 
@@ -20,6 +21,33 @@ pub const DEFAULT_PORT: u16 = 27017;
 /// segment (mongo `authSource` default is `admin`).
 pub const DEFAULT_AUTH_DB: &str = "admin";
 
+/// TLS policy for the connection. Only two levels: mongo has no wire
+/// negotiation probe like the postgres `SSLRequest`/`S|N` dance, so a
+/// `prefer` fallback would mean sending a `ClientHello` that a
+/// plaintext mongod parses as a wire message with a huge length and
+/// deadlocks against. The mongo ecosystem treats TLS as on/off for the
+/// same reason; this surface follows that instead of the postgres
+/// three-level shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SslMode {
+    /// Plain TCP (default; back-compat with the pre-TLS verticals).
+    #[default]
+    Disable,
+    /// TLS is mandatory from the first byte. Certificates are always
+    /// verified (OS roots or `ssl_root_cert`); no insecure mode.
+    Require,
+}
+
+impl SslMode {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "disable" => Some(Self::Disable),
+            "require" => Some(Self::Require),
+            _ => None,
+        }
+    }
+}
+
 /// Everything the wire layer needs to reach and authenticate against
 /// one mongod / mongos.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,6 +59,9 @@ pub struct MongoTarget {
     pub password: Option<String>,
     /// Database the SCRAM credentials live in (`authSource`).
     pub auth_db: String,
+    pub ssl_mode: SslMode,
+    /// Optional PEM file with extra trust anchors; overrides OS roots.
+    pub ssl_root_cert: Option<String>,
 }
 
 pub fn percent_decode<'a>(value: &'a str, context: &str) -> Result<Cow<'a, str>, ConnectionError> {
@@ -146,6 +177,8 @@ pub fn parse_target(
         user,
         password,
         auth_db,
+        ssl_mode: SslMode::default(),
+        ssl_root_cert: None,
     })
 }
 
@@ -172,6 +205,19 @@ mod tests {
         assert_eq!(target.user, None);
         assert_eq!(target.password, None);
         assert_eq!(target.auth_db, DEFAULT_AUTH_DB);
+        assert_eq!(target.ssl_mode, SslMode::Disable);
+        assert_eq!(target.ssl_root_cert, None);
+    }
+
+    #[test]
+    fn ssl_mode_parser_is_two_valued() {
+        assert_eq!(SslMode::parse("disable"), Some(SslMode::Disable));
+        assert_eq!(SslMode::parse("require"), Some(SslMode::Require));
+        // No mongo negotiation exists, so the postgres `prefer` level is
+        // not a mode here (documented in the enum).
+        assert_eq!(SslMode::parse("prefer"), None);
+        assert_eq!(SslMode::parse("bogus"), None);
+        assert_eq!(SslMode::default(), SslMode::Disable);
     }
 
     #[test]

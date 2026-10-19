@@ -7,6 +7,10 @@
 //! purpose so the serialized statement gate path (`SingleThreadLock`
 //! analog) is exercised from day one.
 //!
+//! Transport: plain TCP or rustls TLS from the first byte
+//! (`ssl_mode: disable|require`, certificates always verified — there
+//! is no `prefer` because mongo has no negotiation probe).
+//!
 //! Statement surface: `"find <collection>"` executed as a single-batch
 //! `find` command (`singleBatch: true`, cursor closed). Parameters are
 //! not supported yet (a filter document language is future work); the
@@ -23,14 +27,14 @@ pub mod bson;
 mod op_msg;
 mod scram;
 pub mod uri;
-mod wire;
+pub mod wire;
 
 use anydb_shared::ConnectionError;
 use anydb_shared::driver::descriptor::DriverDescriptor;
 use anydb_shared::driver::spi::{DataSource, DataSourceMetadata, Driver, OpenRequest};
 use anydb_shared::driver::statement::{QueryParameter, StatementResult, TypedStatementResult};
 
-use crate::uri::MongoTarget;
+use crate::uri::{MongoTarget, SslMode};
 use crate::wire::Connection as WireConnection;
 
 #[derive(Debug)]
@@ -72,7 +76,8 @@ impl MongoDriver {
 
 /// URL credentials win the user slot (properties only fill a missing
 /// user); `password` and `auth_source` are property-overridable
-/// (the secrets pipeline writes there).
+/// (the secrets pipeline writes there). TLS policy comes from
+/// `ssl_mode` / `ssl_root_cert` settings.
 fn resolve_target(request: &OpenRequest) -> Result<MongoTarget, ConnectionError> {
     let user = request.properties.get("user").map(String::as_str);
     let mut target = uri::parse_target(&request.target, user)?;
@@ -83,6 +88,16 @@ fn resolve_target(request: &OpenRequest) -> Result<MongoTarget, ConnectionError>
         && !value.is_empty()
     {
         target.auth_db = value.clone();
+    }
+    if let Some(value) = request.properties.get("ssl_mode") {
+        target.ssl_mode = SslMode::parse(value).ok_or_else(|| {
+            ConnectionError::Protocol(format!(
+                "invalid ssl_mode '{value}' (expected disable|require)"
+            ))
+        })?;
+    }
+    if let Some(value) = request.properties.get("ssl_root_cert") {
+        target.ssl_root_cert = Some(value.clone());
     }
     Ok(target)
 }
@@ -307,6 +322,34 @@ mod tests {
         assert_eq!(target.user.as_deref(), Some("urluser"));
         assert_eq!(target.password.as_deref(), Some("ppass"));
         assert_eq!(target.auth_db, "pauth");
+    }
+
+    #[test]
+    fn resolve_target_applies_tls_settings() {
+        let request = OpenRequest {
+            container_id: "c1".into(),
+            target: "mongodb://host:1".into(),
+            properties: HashMap::from([
+                ("ssl_mode".to_owned(), "require".to_owned()),
+                ("ssl_root_cert".to_owned(), "C:/roots/host.pem".to_owned()),
+            ]),
+        };
+        let target = resolve_target(&request).expect("resolved");
+        assert_eq!(target.ssl_mode, SslMode::Require);
+        assert_eq!(target.ssl_root_cert.as_deref(), Some("C:/roots/host.pem"));
+
+        let request = OpenRequest {
+            container_id: "c1".into(),
+            target: "mongodb://host:1".into(),
+            properties: HashMap::from([("ssl_mode".to_owned(), "prefer".to_owned())]),
+        };
+        match resolve_target(&request) {
+            Ok(_) => panic!("'prefer' is not a mongo mode"),
+            Err(error) => assert!(
+                matches!(error, ConnectionError::Protocol(ref message) if message.contains("invalid ssl_mode")),
+                "unexpected error: {error:?}"
+            ),
+        }
     }
 
     #[test]

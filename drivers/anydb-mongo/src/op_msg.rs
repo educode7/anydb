@@ -5,8 +5,7 @@
 //! (extra sections, checksummed or `moreToCome` messages are explicit
 //! `Protocol` errors instead of silent skips).
 
-use tokio::io::AsyncReadExt;
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::bson::{self, Document};
 use anydb_shared::ConnectionError;
@@ -31,9 +30,10 @@ pub struct OpMsg {
 }
 
 impl OpMsg {
-    /// One reply frame. Rejects flags the driver does not support and
-    /// trailing bytes after the single body document.
-    pub async fn read(stream: &mut TcpStream) -> Result<Self, ConnectionError> {
+    /// One reply frame over any byte source (TCP or TLS). Rejects flags
+    /// the driver does not support and trailing bytes after the single
+    /// body document.
+    pub async fn read(stream: &mut (impl AsyncRead + Unpin)) -> Result<Self, ConnectionError> {
         let mut header = [0u8; HEADER_SIZE];
         stream
             .read_exact(&mut header)

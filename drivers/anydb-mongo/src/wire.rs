@@ -1,24 +1,113 @@
 //! Mongo wire client over OP_MSG: `hello` handshake (_learned_
 //! `saslSupportedMechs`), SCRAM authentication, one-shot `find` and
-//! `ping`. One `Connection` drives exactly one TCP stream; concurrency
-//! is serialized one level up (the driver facade's tokio mutex), so all
-//! methods take `&mut self`.
+//! `ping`. One `Connection` drives exactly one transport (plain TCP or
+//! rustls TLS started from the first byte); concurrency is serialized
+//! one level up (the driver facade's tokio mutex), so all methods take
+//! `&mut self`.
 //!
-//! Deliberate scope: plaintext TCP only (TLS is future wire work), and
-//! cursors are single-batch (`singleBatch: true`) — batch resumption is
-//! the paging vertical, not this layer.
+//! Deliberate scope: `ssl_mode` is only `disable`/`require` (mongo has
+//! no negotiation probe — see the `SslMode` doc), certificates are
+//! always verified, and cursors are single-batch (`singleBatch: true`)
+//! — batch resumption is the paging vertical, not this layer.
+
+use std::pin::Pin;
+use std::task::{Context as TaskContext, Poll};
 
 use tokio::io::AsyncWriteExt as _;
 use tokio::net::TcpStream;
+use tokio_rustls::TlsConnector;
+
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, ServerName};
+use rustls::{ClientConfig, RootCertStore};
 
 use crate::bson::{Bson, Document};
 use crate::op_msg::OpMsg;
 use crate::scram::{Mechanism, ScramClient};
-use crate::uri::MongoTarget;
+use crate::uri::{MongoTarget, SslMode};
 use anydb_shared::ConnectionError;
 
 fn protocol(message: String) -> ConnectionError {
     ConnectionError::Protocol(format!("mongo wire: {message}"))
+}
+
+/// One client transport: raw TCP or the TLS stream upgraded from the
+/// first byte (mongo has no SSLRequest dance; a `require` target is
+/// TLS-wrapped before the first `hello` byte leaves).
+#[derive(Debug)]
+enum NetStream {
+    Plain(TcpStream),
+    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+}
+
+impl tokio::io::AsyncRead for NetStream {
+    #[inline]
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match &mut *self {
+            Self::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
+            Self::Tls(stream) => Pin::new(&mut **stream).poll_read(cx, buf),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for NetStream {
+    #[inline]
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        bufs: &[u8],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        match &mut *self {
+            Self::Plain(stream) => Pin::new(stream).poll_write(cx, bufs),
+            Self::Tls(stream) => Pin::new(&mut **stream).poll_write(cx, bufs),
+        }
+    }
+
+    #[inline]
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        match &mut *self {
+            Self::Plain(stream) => Pin::new(stream).poll_flush(cx),
+            Self::Tls(stream) => Pin::new(&mut **stream).poll_flush(cx),
+        }
+    }
+
+    #[inline]
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        match &mut *self {
+            Self::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
+            Self::Tls(stream) => Pin::new(&mut **stream).poll_shutdown(cx),
+        }
+    }
+
+    #[inline]
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        match &mut *self {
+            Self::Plain(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
+            Self::Tls(stream) => Pin::new(&mut **stream).poll_write_vectored(cx, bufs),
+        }
+    }
+
+    #[inline]
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            Self::Plain(stream) => stream.is_write_vectored(),
+            Self::Tls(stream) => stream.is_write_vectored(),
+        }
+    }
 }
 
 fn int32_field(document: &Document, key: &str) -> i32 {
@@ -31,18 +120,25 @@ fn int32_field(document: &Document, key: &str) -> i32 {
 
 #[derive(Debug)]
 pub struct Connection {
-    stream: TcpStream,
+    stream: NetStream,
     next_request_id: i32,
     server_version: String,
 }
 
 impl Connection {
-    /// TCP connect + `hello` handshake + optional SCRAM. A URL without
-    /// credentials connects anonymously (SCRAM is skipped entirely).
+    /// Dial (plain TCP or TLS per `ssl_mode`) + `hello` handshake +
+    /// optional SCRAM. A URL without credentials connects anonymously
+    /// (SCRAM is skipped entirely).
     pub async fn connect(target: &MongoTarget) -> Result<Self, ConnectionError> {
-        let stream = TcpStream::connect((target.host.as_str(), target.port))
-            .await
-            .map_err(|_| ConnectionError::NetworkFailure)?;
+        let stream = match target.ssl_mode {
+            SslMode::Disable => NetStream::Plain(
+                TcpStream::connect((target.host.as_str(), target.port))
+                    .await
+                    .map_err(|_| ConnectionError::NetworkFailure)?,
+            ),
+            SslMode::Require => NetStream::Tls(Box::new(tls_connect(target).await?)),
+        };
+
         let mut connection = Self {
             stream,
             next_request_id: 1,
@@ -230,6 +326,79 @@ impl Connection {
     /// Closes the TCP stream: drop-based; mongo has no close
     /// acknowledge like the postgres X message.
     pub async fn terminate(self) {}
+}
+
+/// Builds the rustls client config: OS roots by default, PEM file
+/// override with `ssl_root_cert`. Certificate verification is always on.
+fn tls_client_config(
+    target: &MongoTarget,
+) -> Result<std::sync::Arc<ClientConfig>, ConnectionError> {
+    let mut roots = RootCertStore::empty();
+    match &target.ssl_root_cert {
+        Some(path) => {
+            let pem_iter = CertificateDer::pem_file_iter(path).map_err(|_| {
+                ConnectionError::Protocol(format!("cannot read ssl_root_cert file: {path}"))
+            })?;
+            let mut loaded = 0usize;
+            for cert in pem_iter {
+                let cert = cert.map_err(|_| {
+                    ConnectionError::Protocol(format!("invalid PEM certificate in {path}"))
+                })?;
+                roots.add_parsable_certificates([cert]);
+                loaded += 1;
+            }
+            if loaded == 0 || roots.is_empty() {
+                return Err(ConnectionError::Protocol(format!(
+                    "no usable root certificates in {path}"
+                )));
+            }
+        }
+        None => {
+            // OS trust store; `CertificateResult` reports load errors inline.
+            let native = rustls_native_certs::load_native_certs();
+            if !native.errors.is_empty() {
+                return Err(ConnectionError::Protocol(format!(
+                    "cannot load native root certificates: {}",
+                    native.errors[0]
+                )));
+            }
+            if native.certs.is_empty() {
+                return Err(ConnectionError::Protocol(
+                    "no trusted root certificates available in the OS store".to_owned(),
+                ));
+            }
+            roots.add_parsable_certificates(native.certs);
+        }
+    }
+
+    let builder =
+        ClientConfig::builder_with_provider(rustls::crypto::ring::default_provider().into())
+            .with_safe_default_protocol_versions()
+            .map_err(|_| {
+                ConnectionError::Protocol("TLS protocol versions unavailable".to_owned())
+            })?;
+    let config = builder.with_root_certificates(roots).with_no_client_auth();
+    Ok(std::sync::Arc::new(config))
+}
+
+/// TCP dial + TLS handshake from the very first byte (there is no
+/// plaintext preamble: the listener on the other side is a TLS server
+/// already). Always full certificate verification.
+async fn tls_connect(
+    target: &MongoTarget,
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>, ConnectionError> {
+    let connector = TlsConnector::from(tls_client_config(target)?);
+    let server_name = ServerName::try_from(target.host.clone()).map_err(|_| {
+        ConnectionError::Protocol(format!("invalid TLS server name: {}", target.host))
+    })?;
+    let tcp = TcpStream::connect((target.host.as_str(), target.port))
+        .await
+        .map_err(|_| ConnectionError::NetworkFailure)?;
+    let tls_stream = connector
+        .connect(server_name, tcp)
+        .await
+        .map_err(|error| ConnectionError::Protocol(format!("TLS handshake failed: {error}")))?;
+    Ok(tls_stream)
 }
 
 fn offered_mechanisms(reply: &Document) -> Option<Vec<String>> {
