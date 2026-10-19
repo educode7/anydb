@@ -560,13 +560,16 @@ impl Connection {
     }
 
     /// `delete` command: the compiled filter as the one query selector
-    /// with `limit: 0` (every matching document goes — SQL DELETE
-    /// semantics), one round-trip. Returns the server's removed count
-    /// (`n`); `writeErrors` and a missing count surface as failures.
+    /// with `limit` choosing the surface form — `0` removes EVERY
+    /// matching document (SQL DELETE semantics), `1` removes at most
+    /// the first (`delete one`). One round-trip; returns the removed
+    /// count (`n`); `writeErrors` and a missing count surface as
+    /// failures.
     pub async fn delete(
         &mut self,
         collection: &str,
         filter: &Document,
+        limit: i32,
     ) -> Result<i64, ConnectionError> {
         let command = Document::from(vec![
             ("delete".to_owned(), Bson::String(collection.to_owned())),
@@ -574,7 +577,7 @@ impl Connection {
                 "deletes".to_owned(),
                 Bson::Array(vec![Bson::Document(Document::from(vec![
                     ("q".to_owned(), Bson::Document(filter.clone())),
-                    ("limit".to_owned(), Bson::Int32(0)),
+                    ("limit".to_owned(), Bson::Int32(limit)),
                 ]))]),
             ),
         ]);

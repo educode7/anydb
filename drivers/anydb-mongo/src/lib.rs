@@ -29,10 +29,13 @@
 //! pages — cursor paging answers `Protocol` for it.
 //!
 //! The destructive half is
-//! `"delete <collection> with <filter-text>"` and
+//! `"delete [one] <collection> with <filter-text>"` — the plain form
+//! removes every match (`limit: 0`), `delete one` at most the first
+//! (`limit: 1`; the token `one` is reserved as the modifier, so a
+//! collection named `one` is not addressable) — and
 //! `"update <collection> with <filter-text> set <json-document>"`: the
-//! filter is required (a filter-less delete never parses), the delete
-//! removes every match, and the update touches every match
+//! filter is required (a filter-less delete never parses), the update
+//! touches every match
 //! (`upsert: false, multi: true`) with the JSON update spec traveling
 //! verbatim as `u`. Write results carry a legible acceptance message
 //! next to the tag/count ("delete coll: 1 document(s) removed",
@@ -213,6 +216,10 @@ pub struct InsertStatement {
 pub struct DeleteStatement {
     pub collection: String,
     filter: filter::Filter,
+    /// `delete one <collection> with <filter>`: the single-document
+    /// form (wire `limit: 1` — at most the first matching document
+    /// goes). The plain form removes every match (`limit: 0`).
+    limit_one: bool,
 }
 
 impl DeleteStatement {
@@ -286,7 +293,7 @@ fn statement_protocol(message: String) -> ConnectionError {
 
 /// Parses `find <collection> [with <filter-text>]`,
 /// `insert <collection> with <json-document>`,
-/// `delete <collection> with <filter-text>` and
+/// `delete [one] <collection> with <filter-text>` and
 /// `update <collection> with <filter-text> set <json-document>` by
 /// slicing the raw SQL: the command word and collection are single
 /// tokens, everything after a standalone `with` is the verbatim filter
@@ -296,25 +303,57 @@ fn statement_protocol(message: String) -> ConnectionError {
 fn parse_statement(sql: &str) -> Result<Statement, ConnectionError> {
     fn unsupported() -> ConnectionError {
         statement_protocol(
-            "mongo statements are 'find <collection> [with <filter>]', 'insert <collection> with <document>', 'delete <collection> with <filter>' or 'update <collection> with <filter> set <document>'"
+            "mongo statements are 'find <collection> [with <filter>]', 'insert <collection> with <document>', 'delete [one] <collection> with <filter>' or 'update <collection> with <filter> set <document>'"
                 .to_owned(),
         )
     }
     // Leading whitespace only separates tokens; the collection and
     // clause boundaries below still need single whitespace splits.
     let sql = sql.trim_start();
-    let Some((command, tail)) = sql.split_once(char::is_whitespace) else {
+    let Some((command, head)) = sql.split_once(char::is_whitespace) else {
         return Err(unsupported());
     };
     if command != "find" && command != "insert" && command != "delete" && command != "update" {
         return Err(unsupported());
     }
+    // `delete one ...`: a standalone `one` selects the single-document
+    // form. The token is RESERVED (the filter grammar's reserved
+    // leading `not` precedent): a collection named `one` is not
+    // addressable, and `delete one` without a collection after it
+    // answers the delete-one form hint.
+    let (tail, limit_one) = if command == "delete" {
+        let head = head.trim_start();
+        let (first, after) = match head.split_once(char::is_whitespace) {
+            Some(split) => split,
+            None => (head, ""),
+        };
+        if first == "one" {
+            if after.trim().is_empty() {
+                return Err(statement_protocol(
+                    "delete one statements are 'delete one <collection> with <filter>'".to_owned(),
+                ));
+            }
+            (after.trim_start(), true)
+        } else {
+            // The whole head stays the tail: the first token may be
+            // the collection.
+            (head, false)
+        }
+    } else {
+        (head, false)
+    };
     let (collection, remainder) = match tail.trim_start().split_once(char::is_whitespace) {
         Some((collection, remainder)) => (collection, remainder.trim_start()),
         None => (tail.trim_start(), ""),
     };
     if collection.is_empty() {
-        return Err(unsupported());
+        return Err(if limit_one {
+            statement_protocol(
+                "delete one statements are 'delete one <collection> with <filter>'".to_owned(),
+            )
+        } else {
+            unsupported()
+        });
     }
     if collection.starts_with('$') {
         return Err(statement_protocol(
@@ -344,9 +383,16 @@ fn parse_statement(sql: &str) -> Result<Statement, ConnectionError> {
         }
         "delete" => {
             if remainder.is_empty() {
-                return Err(statement_protocol(
-                    "delete statements are 'delete <collection> with <filter>'".to_owned(),
-                ));
+                return Err(if limit_one {
+                    statement_protocol(
+                        "delete one statements are 'delete one <collection> with <filter>'"
+                            .to_owned(),
+                    )
+                } else {
+                    statement_protocol(
+                        "delete statements are 'delete <collection> with <filter>'".to_owned(),
+                    )
+                });
             }
             // A delete always carries the compiled filter: a filter-less
             // delete would match everything, so that shape is never a
@@ -357,6 +403,7 @@ fn parse_statement(sql: &str) -> Result<Statement, ConnectionError> {
             Ok(Statement::Delete(DeleteStatement {
                 collection: collection.to_owned(),
                 filter,
+                limit_one,
             }))
         }
         "update" => {
@@ -556,7 +603,13 @@ impl WireDataSource {
         let Some(connection) = guard.as_mut() else {
             return Err(ConnectionError::DriverFailure);
         };
-        let removed = connection.delete(&statement.collection, &filter).await?;
+        let removed = connection
+            .delete(
+                &statement.collection,
+                &filter,
+                if statement.limit_one { 1 } else { 0 },
+            )
+            .await?;
         Ok(TypedStatementResult {
             columns: Vec::new(),
             rows: Vec::new(),

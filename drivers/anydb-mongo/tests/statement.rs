@@ -1021,7 +1021,7 @@ async fn insert_failures_never_reach_the_wire() {
         .expect_err("missing collection");
     assert!(protocol_error(
         error,
-        "mongo statements are 'find <collection> [with <filter>]', 'insert <collection> with <document>', 'delete <collection> with <filter>' or 'update <collection> with <filter> set <document>'"
+        "mongo statements are 'find <collection> [with <filter>]', 'insert <collection> with <document>', 'delete [one] <collection> with <filter>' or 'update <collection> with <filter> set <document>'"
     ));
 
     // The handshake-only server answers `ok: 0` to any command it does
@@ -1064,9 +1064,15 @@ fn update_reply(matched: i32, modified: i32) -> Document {
 }
 
 /// Handshake + exactly one `delete` command: asserts the full wire
-/// shape (the compiled filter as the only selector with `limit: 0`,
-/// the `$db` argument), then replies.
-async fn delete_server(stream: TcpStream, expected_filter: Document, reply: Document) {
+/// shape (the compiled filter as the only selector with the expected
+/// limit — `0` all-matching, `1` single-document, the `$db` argument),
+/// then replies.
+async fn delete_server(
+    stream: TcpStream,
+    expected_filter: Document,
+    expected_limit: i32,
+    reply: Document,
+) {
     let mut stream = stream;
     handshake(&mut stream).await;
     let Some((request_id, command)) = read_frame(&mut stream).await else {
@@ -1082,10 +1088,10 @@ async fn delete_server(stream: TcpStream, expected_filter: Document, reply: Docu
         field(&command, "deletes"),
         &Bson::Array(vec![Bson::Document(vec![
             ("q".to_owned(), Bson::Document(expected_filter)),
-            ("limit".to_owned(), int32(0)),
+            ("limit".to_owned(), int32(expected_limit)),
         ])]),
         "deletes carries the compiled filter as the only selector \
-         with the remove-all limit"
+         with the statement's limit"
     );
     assert_eq!(
         field(&command, "$db"),
@@ -1138,7 +1144,7 @@ async fn update_server(
 async fn delete_removes_every_match_and_says_so() {
     let expected_filter = vec![("n".to_owned(), int32(3))];
     let (port, server) =
-        spawn_server(move |stream| delete_server(stream, expected_filter, delete_reply(2)));
+        spawn_server(move |stream| delete_server(stream, expected_filter, 0, delete_reply(2)));
     let source = source_for(port).await;
 
     // The delete travels ONLY behind the confirmed seam.
@@ -1163,7 +1169,7 @@ async fn delete_removes_every_match_and_says_so() {
 async fn the_unconfirmed_delete_refuses_and_the_connection_survives() {
     let expected_filter = vec![("n".to_owned(), int32(1))];
     let (port, server) =
-        spawn_server(move |stream| delete_server(stream, expected_filter, delete_reply(1)));
+        spawn_server(move |stream| delete_server(stream, expected_filter, 0, delete_reply(1)));
     let source = source_for(port).await;
 
     // The ordinary typed surface refuses BEFORE any wire bytes: the
@@ -1238,7 +1244,7 @@ async fn delete_shapes_beyond_the_wire_never_reach_it() {
 async fn a_bound_delete_filters_with_the_parameter() {
     let expected_filter = vec![("n".to_owned(), Bson::Int64(4))];
     let (port, server) =
-        spawn_server(move |stream| delete_server(stream, expected_filter, delete_reply(0)));
+        spawn_server(move |stream| delete_server(stream, expected_filter, 0, delete_reply(0)));
     let source = source_for(port).await;
 
     let typed = source
@@ -1483,7 +1489,8 @@ async fn an_update_reply_without_its_modified_count_is_a_protocol_error() {
 async fn a_delete_reply_without_its_count_is_a_protocol_error() {
     let reply = Document::from(vec![("ok".to_owned(), int32(1))]);
     let expected_filter = vec![("n".to_owned(), int32(2))];
-    let (port, server) = spawn_server(move |stream| delete_server(stream, expected_filter, reply));
+    let (port, server) =
+        spawn_server(move |stream| delete_server(stream, expected_filter, 0, reply));
     let source = source_for(port).await;
 
     let error = source
@@ -1496,6 +1503,85 @@ async fn a_delete_reply_without_its_count_is_a_protocol_error() {
     );
 
     server.await.expect("server task");
+}
+
+#[tokio::test]
+async fn delete_one_removes_at_most_the_first_match_and_says_so() {
+    let expected_filter = vec![("n".to_owned(), int32(2))];
+    let (port, server) =
+        spawn_server(move |stream| delete_server(stream, expected_filter, 1, delete_reply(1)));
+    let source = source_for(port).await;
+
+    let typed = source
+        .execute_statement_typed_confirmed("delete one components with n = 2", &[])
+        .await
+        .expect("the confirmed seam runs the single-document delete");
+    assert!(typed.columns.is_empty(), "a delete yields no columns");
+    assert!(typed.rows.is_empty(), "a delete yields no rows");
+    assert_eq!(typed.command_tag, Some("delete 1".to_owned()));
+    assert_eq!(typed.affected_rows, Some(1));
+    assert_eq!(
+        typed.message,
+        Some("delete components: 1 document(s) removed".to_owned()),
+        "the legible acceptance is the same contract, the limit is wire-side"
+    );
+
+    server.await.expect("server task");
+}
+
+#[tokio::test]
+async fn delete_one_wire_limit_comes_from_the_statement_not_the_default() {
+    // The reserved-token rule keeps the all-matching form byte-identical:
+    // `delete <c> with <f>` still ships limit 0, `delete one <c> with <f>`
+    // ships limit 1 with the SAME filter compilation.
+    let expected_filter = vec![("n".to_owned(), int32(2))];
+    let (port, server) =
+        spawn_server(move |stream| delete_server(stream, expected_filter, 0, delete_reply(2)));
+    let source = source_for(port).await;
+    let typed = source
+        .execute_statement_typed_confirmed("delete components with n = 2", &[])
+        .await
+        .expect("the plain form keeps the remove-all limit");
+    assert_eq!(typed.command_tag, Some("delete 2".to_owned()));
+    server.await.expect("server task");
+}
+
+#[tokio::test]
+async fn delete_one_shapes_beyond_the_wire_never_reach_it() {
+    let (port, server) = spawn_server(handshake_only_server);
+    let source = source_for(port).await;
+
+    // `delete one` alone: no collection after the reserved modifier.
+    let error = source
+        .execute_statement_typed_confirmed("delete one", &[])
+        .await
+        .expect_err("the modifier without a collection is not a statement");
+    assert!(protocol_error(
+        error,
+        "delete one statements are 'delete one <collection> with <filter>'"
+    ));
+
+    // Missing filter text: the same hint, still client-side.
+    let error = source
+        .execute_statement_typed_confirmed("delete one components", &[])
+        .await
+        .expect_err("the single-document form requires its filter too");
+    assert!(protocol_error(
+        error,
+        "delete one statements are 'delete one <collection> with <filter>'"
+    ));
+
+    // The gate governs the single-document form too.
+    let error = source
+        .execute_statement_typed("delete one components with n = 1", &[])
+        .await
+        .expect_err("the ordinary surface refuses a delete one");
+    assert!(
+        protocol_error(error, "delete statements are destructive"),
+        "the confirmed seam rules every delete form"
+    );
+
+    drop(server);
 }
 
 #[tokio::test]

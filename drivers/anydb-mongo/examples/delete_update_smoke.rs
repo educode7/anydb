@@ -13,14 +13,17 @@
 //!    verified back through a find;
 //! 4. `delete` through the confirmed seam — "document(s) removed"
 //!    acceptance, counts asserted after each leg;
-//! 5. the collection ends EMPTY (both deletions + verified `find 0`).
+//! 5. `delete one` — the surgical leg removes exactly one of the two
+//!    survivors, verified server-side;
+//! 6. the collection ends EMPTY (all-matching deletion + `find 0`).
 //!
 //! Non-zero exit means a failed statement or a failed assertion.
 //!
 //! Live evidence (mongo 7.0 container `anydb-mongo`): gate refusal
 //! `delete statements are destructive ...`, `insert 1` x3, `update docs:
 //! 1 matched, 1 modified`, `find 1`, `delete docs: 1 document(s)
-//! removed`, `find 2`, `delete docs: 2 document(s) removed`, `find 0`.
+//! removed`, `find 2`, `delete one docs: 1 document(s) removed`,
+//! `find 1`, `delete docs: 1 document(s) removed`, `find 0`.
 
 use anydb_mongo::MongoDriver;
 use anydb_shared::driver::spi::{DataSource as _, DataSourceMetadata, OpenRequest};
@@ -121,14 +124,35 @@ async fn main() {
     assert_eq!(typed.command_tag, Some("find 2".to_owned()));
     println!("delete verified server-side: find 2");
 
-    // 5) The remaining two go the same way; the acceptance says so.
+    // 5) THE SURGICAL LEG: the single-document form removes exactly
+    //    one of the two survivors, and the acceptance says so.
     let typed = source
-        .execute_statement_typed_confirmed("delete docs with n = 2 or n = 3", &[])
+        .execute_statement_typed_confirmed("delete one docs with tag = 'smoke-b'", &[])
         .await
-        .expect("the confirmed seam runs the second delete");
-    assert_eq!(typed.command_tag, Some("delete 2".to_owned()));
-    let remaining_acceptance = typed.message.expect("second delete acceptance");
-    assert_eq!(remaining_acceptance, "delete docs: 2 document(s) removed");
+        .expect("the confirmed seam runs the single-document delete");
+    assert_eq!(typed.command_tag, Some("delete 1".to_owned()));
+    let surgical_acceptance = typed.message.expect("delete one acceptance");
+    assert_eq!(surgical_acceptance, "delete docs: 1 document(s) removed");
+    println!("acceptance (delete one): {surgical_acceptance}");
+
+    // Exactly `smoke-b` went; the survivor stays.
+    let typed = source
+        .execute_statement_typed("find docs with tag = 'smoke-c'", &[])
+        .await
+        .expect("verify the surgical deletion kept the survivor");
+    assert_eq!(typed.command_tag, Some("find 1".to_owned()));
+    println!("delete one verified server-side: find 1");
+
+    // 6) The last survivor goes the same all-matching way; the
+    //    acceptance reports the honest count (one, after the surgical
+    //    leg already took its document).
+    let typed = source
+        .execute_statement_typed_confirmed("delete docs with n = 3", &[])
+        .await
+        .expect("the confirmed seam runs the final delete");
+    assert_eq!(typed.command_tag, Some("delete 1".to_owned()));
+    let remaining_acceptance = typed.message.expect("final delete acceptance");
+    assert_eq!(remaining_acceptance, "delete docs: 1 document(s) removed");
     println!("acceptance: {remaining_acceptance}");
 
     let typed = source
