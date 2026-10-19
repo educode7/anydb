@@ -72,6 +72,17 @@ async fn main() {
         .expect("filtered find");
     print_result(&filtered, "find anydb_smoke with n > ? and tag = ?");
 
+    // 2b) Or + parenthesized groups: `and` binds tighter, so this is
+    // {n in [1,3]} or {tag = 'dec'} server-side.
+    let combined = source
+        .execute_statement_typed("find anydb_smoke with (n in (1, 3) or tag = 'dec')", &[])
+        .await
+        .expect("or-filtered find");
+    print_result(
+        &combined,
+        "find anydb_smoke with (n in (1, 3) or tag = 'dec')",
+    );
+
     // 3) Cursor paging: batches of two while the cursor id stays open.
     let mut page = source
         .query_page_start(

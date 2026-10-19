@@ -6,34 +6,50 @@
 //! so this is the jdbc-bind analog), never by string interpolation:
 //! injection-safe by construction.
 //!
-//! Grammar (v1, conjunctive only — `or`/`not`/grouping are explicit
-//! protocol errors, never ignored):
+//! Grammar (v2 adds parenthesized groups and `or`; `not` remains an
+//! explicit protocol error, never ignored):
 //!
 //! ```text
-//! filter    := predicate ( ('and' | ',') predicate )*
-//! predicate := path op value | path 'in' '(' (value (',' value)*)? ')'
-//! op        := '=' | '!=' | '<' | '<=' | '>' | '>=' | 'in'
-//! value     := number | string | true | false | null | '?' (param)
-//! path      := segment ('.' segment)*   // segments: [A-Za-z0-9_], no '$'
-//! string    := 'single quoted ('' escapes)' | "double quoted ("" escapes)"
+//! filter     := or_expr
+//! or_expr    := and_expr ('or' and_expr)*        // lowest precedence
+//! and_expr   := atom ( ('and' | ',') atom )*
+//! atom       := '(' or_expr ')' | predicate
+//! predicate  := path op value | path 'in' '(' (value (',' value)*)? ')'
+//! op         := '=' | '!=' | '<' | '<=' | '>' | '>=' | 'in'
+//! value      := number | string | true | false | null | '?' (param)
+//! path       := segment ('.' segment)*   // segments: [A-Za-z0-9_], no '$'
+//! string     := 'single quoted ('' escapes)' | "double quoted ("" escapes)"
 //! ```
 //!
-//! Literals: integers become `Int32` when they fit (mongo shell
-//! convention), `Int64` when they do not; decimal/exponent forms become
-//! `Double`. Keywords are case-insensitive. `?` placeholders bind
-//! positionally to the statement parameters: `Integer` maps to `Int64`
-//! (mongo compares numerically across widths), `Float` to `Double`,
-//! `Text` to `String`, `Binary` to `Binary`, `Boolean` to `Boolean`,
-//! `Null` to `null`. A literal `?` character cannot exist unquoted in
-//! filter text.
+//! `and` binds tighter than `or` (`a = 1 and b = 2 or c = 3` is
+//! `{a=1, b=2} or {c=3}`). Parenthesized groups cut anywhere; nesting
+//! is capped at 16 levels and an empty group is an error. Literals:
+//! integers become `Int32` when they fit (mongo shell convention),
+//! `Int64` when they do not; decimal/exponent forms become `Double`.
+//! Keywords are case-insensitive. `?` placeholders bind positionally
+//! to the statement parameters (in first-seen order across all
+//! branches): `Integer` maps to `Int64` (mongo compares numerically
+//! across widths), `Float` to `Double`, `Text` to `String`, `Binary`
+//! to `Binary`, `Boolean` to `Boolean`, `Null` to `null`. A literal
+//! `?` character cannot exist unquoted in filter text.
 //!
-//! Predicates on the same path merge into ONE operator document
-//! (`n > 1 and n < 5` becomes `{n: {$gt: 1, $lt: 5}}`, mongo's canonical
-//! range shape); a lone equality keeps the natural shorthand
-//! (`{n: 3}`); equality sharing a path with a range renders through
-//! `$eq`; a second equality, a repeated operator, or an `in` next to
-//! anything else on the same path is a conflict error instead of a
-//! silently contradictory or ambiguous filter.
+//! Compiling: a conjunctive run of predicates on the same path merges
+//! into ONE operator document (`n > 1 and n < 5` becomes
+//! `{n: {$gt: 1, $lt: 5}}`, mongo's canonical range shape; a lone
+//! equality keeps the natural shorthand `{n: 3}`); equality sharing a
+//! path with a range renders through `$eq`; a second equality, a
+//! repeated operator, or an `in` next to anything else on the same
+//! path is a conflict error instead of a silently contradictory or
+//! ambiguous filter. `or` renders as the mongo `$or` top-level key
+//! over compiled branch documents — a conflict-free single branch
+//! stays a plain document (no `$or` wrapper for one alternative). An
+//! `and` chain mixing predicates with TWO or more parenthesized
+//! alternatives wraps the extra branch documents under mongo's
+//! `$and`; one alternative sits directly beside the merged fields.
+//! Because paths reject `$` at the tokenizer, compiled `$or`/`$and`
+//! keys can never collide with field names. Merge/conflict checks
+//! apply within each conjunctive run: predicates equal by text but in
+//! different or-branches are independent and merge freely.
 
 use crate::bson::{Bson, Document};
 use anydb_shared::ConnectionError;
@@ -89,11 +105,24 @@ struct Predicate {
     values: Vec<Value>,
 }
 
+/// One node of the grammatical precedence tree: `and` chains merge
+/// per-path, `or` chains take branch documents.
+#[derive(Debug, Clone, PartialEq)]
+enum Node {
+    /// All children must match (an `and` chain or a bare predicate
+    /// promoted by the one-atom unwrapping).
+    And(Vec<Node>),
+    /// At least one child must match.
+    Or(Vec<Node>),
+    Pred(Predicate),
+}
+
 /// A parsed filter: the output of the two-phase compile (parse ->
 /// bind), mirroring the postgres Parse/Bind split.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Filter {
-    predicates: Vec<Predicate>,
+    /// The whole expression tree.
+    root: Node,
     placeholders: usize,
 }
 
@@ -106,6 +135,10 @@ struct Merged {
     /// The values of the `in` list, when the path has one.
     in_list: Option<Vec<Bson>>,
 }
+
+/// Maximum parenthesized-group nesting the parser accepts (recursion
+/// guard; deeper filters are an explicit error, never truncated).
+const MAX_GROUP_DEPTH: usize = 16;
 
 impl Filter {
     /// Binds the statement parameters positionally and produces the
@@ -120,79 +153,153 @@ impl Filter {
                 params.len()
             )));
         }
+        self.compile(&self.root, params)
+    }
 
-        let mut merged: Vec<Merged> = Vec::new();
-        for predicate in &self.predicates {
-            let path = predicate.path.join(".");
-            match predicate.op {
-                Op::In => {
-                    let values = predicate
-                        .values
-                        .iter()
-                        .map(|value| bind_value(value, params))
-                        .collect::<Result<Vec<_>, _>>()?;
-                    match merged.iter_mut().find(|m| m.path == predicate.path) {
-                        Some(_) => {
-                            return Err(protocol(format!(
-                                "conflicting 'in' predicates for path '{path}'"
-                            )));
-                        }
-                        None => merged.push(Merged {
-                            path: predicate.path.clone(),
-                            slots: Vec::new(),
-                            in_list: Some(values),
-                        }),
+    /// Compiles one node of the precedence tree. `And` children that
+    /// are predicates merge per path (the v1 rules, now scoped to the
+    /// conjunctive run); non-predicate children compile to their own
+    /// documents — at most one sits beside the fields, two or more
+    /// wrap under mongo's top-level `$and`.
+    fn compile(&self, node: &Node, params: &[QueryParameter]) -> Result<Document, ConnectionError> {
+        match node {
+            Node::Pred(_) => {
+                let mut merged = Vec::new();
+                merge_into(&mut merged, node, params)?;
+                Ok(render_merged(merged))
+            }
+            Node::Or(children) => {
+                let mut branches = Vec::new();
+                for child in children {
+                    branches.push(Bson::Document(self.compile(child, params)?));
+                }
+                Ok(vec![("$or".to_owned(), Bson::Array(branches))])
+            }
+            Node::And(children) => {
+                let mut merged: Vec<Merged> = Vec::new();
+                let mut groups: Vec<Document> = Vec::new();
+                for child in children {
+                    match child {
+                        Node::Pred(_) => merge_into(&mut merged, child, params)?,
+                        other => groups.push(self.compile(other, params)?),
                     }
                 }
-                op => {
-                    let value = bind_value(&predicate.value, params)?;
-                    match merged.iter_mut().find(|m| m.path == predicate.path) {
-                        Some(entry) => {
-                            if entry.in_list.is_some() {
-                                return Err(protocol(format!(
-                                    "'in' and '{op_key}' cannot share path '{path}'",
-                                    op_key = op.key()
-                                )));
-                            }
-                            if entry.slots.iter().any(|(slot, _)| *slot == op) {
-                                return Err(protocol(format!(
-                                    "repeated {} predicate for path '{path}'",
-                                    if op == Op::Eq { "equality" } else { op.key() }
-                                )));
-                            }
-                            entry.slots.push((op, value));
-                        }
-                        None => merged.push(Merged {
-                            path: predicate.path.clone(),
-                            slots: vec![(op, value)],
-                            in_list: None,
-                        }),
-                    }
+                // `$or`/`$and` cannot collide with fields (paths reject
+                // `$` at the tokenizer), so appending group documents
+                // beside merged fields is unambiguous in shape.
+                if groups.is_empty() {
+                    return Ok(render_merged(merged));
+                }
+                if groups.len() == 1 {
+                    return Ok(render_merged(merged)
+                        .into_iter()
+                        .chain(groups.into_iter().next().expect("len checked"))
+                        .collect());
+                }
+                let mut entries = render_merged(merged);
+                entries.push((
+                    "$and".to_owned(),
+                    Bson::Array(groups.into_iter().map(Bson::Document).collect()),
+                ));
+                Ok(entries)
+            }
+        }
+    }
+}
+
+/// Applies one predicate to the per-path merge state (binding its
+/// values first): the conflict rules — repeated operators, `in`
+/// sharing a path with another operator, double `in`.
+fn merge_into(
+    merged: &mut Vec<Merged>,
+    node: &Node,
+    params: &[QueryParameter],
+) -> Result<(), ConnectionError> {
+    let Node::Pred(predicate) = node else {
+        return Err(protocol(
+            "internal: only predicates merge per path".to_owned(),
+        ));
+    };
+    let path = predicate.path.join(".");
+    match predicate.op {
+        Op::In => {
+            let values = predicate
+                .values
+                .iter()
+                .map(|value| bind_value(value, params))
+                .collect::<Result<Vec<_>, _>>()?;
+            match merged.iter_mut().find(|m| m.path == predicate.path) {
+                Some(_) => Err(protocol(format!(
+                    "conflicting 'in' predicates for path '{path}'"
+                ))),
+                None => {
+                    merged.push(Merged {
+                        path: predicate.path.clone(),
+                        slots: Vec::new(),
+                        in_list: Some(values),
+                    });
+                    Ok(())
                 }
             }
         }
+        op => {
+            let value = bind_value(&predicate.value, params)?;
 
-        Ok(merged
-            .into_iter()
-            .map(|entry| {
-                let field = entry.path.join(".");
-                let value = if entry.slots.len() == 1 && entry.slots[0].0 == Op::Eq {
-                    // A lone equality keeps the natural shorthand.
-                    entry.slots[0].1.clone()
-                } else {
-                    let mut operators: Vec<(String, Bson)> = Vec::new();
-                    for (op, value) in entry.slots {
-                        operators.push((op.key().to_owned(), value));
+            match merged.iter_mut().find(|m| m.path == predicate.path) {
+                Some(entry) => {
+                    if entry.in_list.is_some() {
+                        return Err(protocol(format!(
+                            "'in' and '{op_key}' cannot share path '{path}'",
+                            op_key = op.key()
+                        )));
                     }
-                    if let Some(list) = entry.in_list {
-                        operators.push((Op::In.key().to_owned(), Bson::Array(list)));
+                    if entry.slots.iter().any(|(slot, _)| *slot == op) {
+                        return Err(protocol(format!(
+                            "repeated {} predicate for path '{path}'",
+                            if op == Op::Eq { "equality" } else { op.key() }
+                        )));
                     }
-                    Bson::Document(operators)
-                };
-                (field, value)
-            })
-            .collect())
+                    entry.slots.push((op, value));
+                    Ok(())
+                }
+                None => {
+                    merged.push(Merged {
+                        path: predicate.path.clone(),
+                        slots: vec![(op, value)],
+                        in_list: None,
+                    });
+                    Ok(())
+                }
+            }
+        }
     }
+}
+
+/// Renders the per-path merge state into the final field entries.
+fn render_merged(merged: Vec<Merged>) -> Document {
+    merged
+        .into_iter()
+        .map(|entry| {
+            let field = entry.path.join(".");
+            let value = if entry.slots.len() == 1
+                && entry.slots[0].0 == Op::Eq
+                && entry.in_list.is_none()
+            {
+                // A lone equality keeps the natural shorthand.
+                entry.slots[0].1.clone()
+            } else {
+                let mut operators: Vec<(String, Bson)> = Vec::new();
+                for (op, value) in entry.slots {
+                    operators.push((op.key().to_owned(), value));
+                }
+                if let Some(list) = entry.in_list {
+                    operators.push((Op::In.key().to_owned(), Bson::Array(list)));
+                }
+                Bson::Document(operators)
+            };
+            (field, value)
+        })
+        .collect()
 }
 
 fn bind_value(value: &Value, params: &[QueryParameter]) -> Result<Bson, ConnectionError> {
@@ -228,25 +335,98 @@ pub fn parse_filter(text: &str) -> Result<Filter, ConnectionError> {
     if tokens.peek()?.is_none() {
         return Err(protocol("empty filter".to_owned()));
     }
-    let mut predicates = Vec::new();
     let mut placeholders = 0usize;
-
-    // The first predicate admits no leading separator.
-    predicates.push(parse_predicate(&mut tokens, &mut placeholders)?);
-    while let Some(token) = tokens.next()? {
-        match token {
-            Token::Comma => {}
-            Token::Ident(ref name) if name.eq_ignore_ascii_case("and") => {}
-            _ => return Err(protocol("expected 'and' between predicates".to_owned())),
-        }
-        // A trailing separator dies here on the missing path.
-        predicates.push(parse_predicate(&mut tokens, &mut placeholders)?);
+    let root = parse_or(&mut tokens, &mut placeholders, 0)?;
+    // Everything above belongs to the grammar; trailing tokens are
+    // structural garbage.
+    if tokens.peek()?.is_some() {
+        return Err(protocol("expected end of filter".to_owned()));
     }
 
-    Ok(Filter {
-        predicates,
-        placeholders,
+    Ok(Filter { root, placeholders })
+}
+
+/// `and_expr ('or' and_expr)*` — the lowest-precedence connector.
+fn parse_or(
+    tokens: &mut Tokenizer,
+    placeholders: &mut usize,
+    depth: usize,
+) -> Result<Node, ConnectionError> {
+    let mut terms = vec![parse_and(tokens, placeholders, depth)?];
+    while matches!(
+        tokens.peek()?,
+        Some(Token::Ident(ref word)) if word.eq_ignore_ascii_case("or")
+    ) {
+        tokens.next()?; // the 'or'
+        terms.push(parse_and(tokens, placeholders, depth)?);
+    }
+    // A one-term `or` unwrap keeps a bare predicate tree from wearing
+    // a pointless wrapper.
+    Ok(if terms.len() == 1 {
+        terms.pop().expect("len checked")
+    } else {
+        Node::Or(terms)
     })
+}
+
+/// `atom ( ('and' | ',') atom )*` — `and` binds tighter than `or`.
+fn parse_and(
+    tokens: &mut Tokenizer,
+    placeholders: &mut usize,
+    depth: usize,
+) -> Result<Node, ConnectionError> {
+    let mut atoms = vec![parse_atom(tokens, placeholders, depth)?];
+    loop {
+        match tokens.peek()? {
+            // The comma stays as the SQL-style explicit separator.
+            Some(Token::Comma) => {
+                tokens.next()?;
+            }
+            Some(Token::Ident(ref word)) if word.eq_ignore_ascii_case("and") => {
+                tokens.next()?;
+            }
+            _ => break,
+        }
+        atoms.push(parse_atom(tokens, placeholders, depth)?);
+    }
+    if atoms.len() == 1 {
+        return Ok(atoms.pop().expect("len checked"));
+    }
+    // A parenthesized and-chain flattens one level so `(n = 1 and
+    // m = 2)` merges beside its neighbors instead of nesting.
+    let mut children = Vec::with_capacity(atoms.len());
+    for atom in atoms {
+        match atom {
+            Node::And(inner) => children.extend(inner),
+            other => children.push(other),
+        }
+    }
+    Ok(Node::And(children))
+}
+
+/// `('(' or_expr ')') | predicate`, with the group nesting guard.
+fn parse_atom(
+    tokens: &mut Tokenizer,
+    placeholders: &mut usize,
+    depth: usize,
+) -> Result<Node, ConnectionError> {
+    if matches!(tokens.peek()?, Some(Token::LParen)) {
+        if depth >= MAX_GROUP_DEPTH {
+            return Err(protocol(format!(
+                "parenthesized groups nest deeper than {MAX_GROUP_DEPTH}"
+            )));
+        }
+        tokens.next()?; // the '('
+        let inner = parse_or(tokens, placeholders, depth + 1)?;
+        match tokens.next()? {
+            Some(Token::RParen) => Ok(inner),
+            _ => Err(protocol("expected ')' to close the group".to_owned())),
+        }
+    } else if matches!(tokens.peek()?, Some(Token::RParen)) {
+        Err(protocol("empty '(...)' group".to_owned()))
+    } else {
+        Ok(Node::Pred(parse_predicate(tokens, placeholders)?))
+    }
 }
 
 /// One `path op value` or `path in (...)`.
@@ -327,6 +507,13 @@ fn parse_path(tokens: &mut Tokenizer) -> Result<Vec<String>, ConnectionError> {
             Some(Token::Ident(segment)) => segment,
             _ => return Err(protocol("expected a field name".to_owned())),
         };
+        // Unary `not` stays an explicit refusal (v1 rule), never a
+        // reinterpretation of the filter.
+        if segment.eq_ignore_ascii_case("not") {
+            return Err(protocol(
+                "unary 'not' is not supported in filters".to_owned(),
+            ));
+        }
         if segment.contains('$') {
             return Err(protocol(format!(
                 "path segments may not contain '$': '{segment}'"
@@ -813,6 +1000,196 @@ mod tests {
     }
 
     #[test]
+    fn or_chains_render_branch_documents_without_precedence_confusion() {
+        // A bare two-branch or.
+        assert_eq!(
+            parse("n = 5 or n = 6"),
+            vec![(
+                "$or".to_owned(),
+                Bson::Array(vec![
+                    Bson::Document(vec![("n".to_owned(), Bson::Int32(5))]),
+                    Bson::Document(vec![("n".to_owned(), Bson::Int32(6))]),
+                ])
+            )]
+        );
+        // `and` binds tighter: a=... and b=... or c=... groups the
+        // conjunction into the first branch.
+        let or = |text: &str| match parse(text).pop() {
+            Some((key, Bson::Array(branches))) if key == "$or" => branches,
+            other => panic!("expected an $or array, got {other:?}"),
+        };
+        assert_eq!(
+            or("flag = true and n < 5 or tag = 'a'"),
+            vec![
+                Bson::Document(vec![
+                    ("flag".to_owned(), Bson::Boolean(true)),
+                    (
+                        "n".to_owned(),
+                        Bson::Document(vec![("$lt".to_owned(), Bson::Int32(5))])
+                    ),
+                ]),
+                Bson::Document(vec![("tag".to_owned(), Bson::String("a".to_owned()))]),
+            ]
+        );
+        assert_eq!(
+            or("a = 1 or b = 2 and c = 3"),
+            vec![
+                Bson::Document(vec![("a".to_owned(), Bson::Int32(1))]),
+                Bson::Document(vec![
+                    ("b".to_owned(), Bson::Int32(2)),
+                    ("c".to_owned(), Bson::Int32(3)),
+                ]),
+            ]
+        );
+    }
+
+    #[test]
+    fn parenthesized_groups_cut_anywhere() {
+        // A group beside a plain predicate.
+        assert_eq!(
+            parse("(n > 1 or tag = 'a') and flag = true"),
+            vec![
+                ("flag".to_owned(), Bson::Boolean(true)),
+                (
+                    "$or".to_owned(),
+                    Bson::Array(vec![
+                        Bson::Document(vec![(
+                            "n".to_owned(),
+                            Bson::Document(vec![("$gt".to_owned(), Bson::Int32(1))])
+                        )]),
+                        Bson::Document(vec![("tag".to_owned(), Bson::String("a".to_owned()))]),
+                    ])
+                ),
+            ]
+        );
+        // Merging keeps working INSIDE a group.
+        assert_eq!(
+            parse("(n > 1 and n < 5) or tag in ('z')"),
+            vec![(
+                "$or".to_owned(),
+                Bson::Array(vec![
+                    Bson::Document(vec![(
+                        "n".to_owned(),
+                        Bson::Document(vec![
+                            ("$gt".to_owned(), Bson::Int32(1)),
+                            ("$lt".to_owned(), Bson::Int32(5)),
+                        ])
+                    )]),
+                    Bson::Document(vec![(
+                        "tag".to_owned(),
+                        Bson::Document(vec![(
+                            "$in".to_owned(),
+                            Bson::Array(vec![Bson::String("z".to_owned())])
+                        )])
+                    )]),
+                ])
+            )]
+        );
+        // Two or-groups in one conjunction wrap under mongo's `$and`.
+        assert_eq!(
+            parse("(a = 1 or b = 2) and (c = 3 or d = 4)"),
+            vec![(
+                "$and".to_owned(),
+                Bson::Array(vec![
+                    Bson::Document(vec![(
+                        "$or".to_owned(),
+                        Bson::Array(vec![
+                            Bson::Document(vec![("a".to_owned(), Bson::Int32(1))]),
+                            Bson::Document(vec![("b".to_owned(), Bson::Int32(2))]),
+                        ])
+                    )]),
+                    Bson::Document(vec![(
+                        "$or".to_owned(),
+                        Bson::Array(vec![
+                            Bson::Document(vec![("c".to_owned(), Bson::Int32(3))]),
+                            Bson::Document(vec![("d".to_owned(), Bson::Int32(4))]),
+                        ])
+                    )]),
+                ])
+            )]
+        );
+        // A parenthesized and-chain flattens: `(x = 1) and (flag = false,
+        // tag = 'z')` merges into one document.
+        assert_eq!(
+            parse("(x = 1) and (flag = false, tag = 'z')"),
+            vec![
+                ("x".to_owned(), Bson::Int32(1)),
+                ("flag".to_owned(), Bson::Boolean(false)),
+                ("tag".to_owned(), Bson::String("z".to_owned())),
+            ]
+        );
+        // A nested or branch.
+        assert_eq!(
+            parse("(a = 1 or (b = 2 and c = 3)) or d = 4")
+                .into_iter()
+                .find(|(key, _)| key == "$or")
+                .map(|(_, value)| value),
+            Some(Bson::Array(vec![
+                Bson::Document(vec![(
+                    "$or".to_owned(),
+                    Bson::Array(vec![
+                        Bson::Document(vec![("a".to_owned(), Bson::Int32(1))]),
+                        Bson::Document(vec![
+                            ("b".to_owned(), Bson::Int32(2)),
+                            ("c".to_owned(), Bson::Int32(3)),
+                        ]),
+                    ])
+                )]),
+                Bson::Document(vec![("d".to_owned(), Bson::Int32(4))]),
+            ]))
+        );
+    }
+
+    #[test]
+    fn params_bind_in_first_seen_order_across_branches() {
+        let document = bind(
+            "(tag = ? or n > ?) and ok = ?",
+            &[
+                QueryParameter::Text("b".to_owned()),
+                QueryParameter::Integer(2),
+                QueryParameter::Boolean(true),
+            ],
+        );
+        // Expected shape: {ok: true, $or: [{tag: 'b'}, {n: {$gt: 2}}]}.
+        assert_eq!(
+            document
+                .iter()
+                .find(|(key, _)| key == "ok")
+                .map(|(_, value)| value.clone()),
+            Some(Bson::Boolean(true))
+        );
+        let or = match document.iter().find(|(key, _)| key == "$or") {
+            Some((_, Bson::Array(branches))) => branches,
+            other => panic!("expected $or, got {other:?}"),
+        };
+        match &or[0] {
+            Bson::Document(branch) => assert_eq!(
+                branch.iter().next(),
+                Some(&("tag".to_owned(), Bson::String("b".to_owned()))),
+                "first '?' belongs to the first branch"
+            ),
+            other => panic!("expected a branch document, got {other:?}"),
+        }
+        match &or[1] {
+            Bson::Document(branch) => assert_eq!(
+                branch.iter().next(),
+                Some(&(
+                    "n".to_owned(),
+                    Bson::Document(vec![("$gt".to_owned(), Bson::Int64(2))])
+                )),
+                "second '?' belongs to the second branch"
+            ),
+            other => panic!("expected a branch document, got {other:?}"),
+        }
+        // Arity still exact across the whole tree: dropping one fails.
+        let filter = parse_filter("n = ? or tag = ?").expect("parses");
+        assert!(matches!(
+            filter.document(&[QueryParameter::Integer(1)]),
+            Err(ConnectionError::Protocol(ref message)) if message.contains("expects 2 parameter")
+        ));
+    }
+
+    #[test]
     fn conflicting_equality_and_repeats_are_errors() {
         assert!(error("n = 1 and n = 2").contains("repeated equality"));
         // Detected pre-bind: even equal parameter values conflict.
@@ -825,6 +1202,11 @@ mod tests {
         assert!(error("n in (1) and n = 2").contains("cannot share path"));
         // A range plus a different range is NOT a conflict: conjunctive.
         let _ = parse("n > 1 and n <= 5");
+        // Conflicts are scoped to each conjunctive run: the same path
+        // in different or-branches is free (each branch merges alone),
+        // but a conflict INSIDE one branch still fails.
+        let _ = parse("n = 1 or n = 2");
+        assert!(error("(n = 1 and n = 2) or tag = 'a'").contains("repeated equality"));
     }
 
     #[test]
@@ -834,9 +1216,8 @@ mod tests {
         assert!(error("n =").contains("expected a literal"));
         assert!(error("n = and").contains("bare identifier"));
         assert!(error("n = 'open").contains("never closed"));
-        assert!(error("n = 5 or n = 6").contains("expected 'and'"));
         assert!(error("n = 1!(").contains("'!' must form the '!='"));
-        assert!(error("n = 1 2").contains("expected 'and'"));
+        assert!(error("n = 1 2").contains("expected end of filter"));
         assert!(error("n in ('a'").contains("expected ',' or ')'"));
         assert!(error("n = -").contains("invalid numeric literal"));
         assert!(error("n = 1e+").contains("invalid numeric literal"));
@@ -844,6 +1225,23 @@ mod tests {
         assert!(error("n in 3").contains("expected '(' after 'in'"));
         // The tokenizer never even forms a '$'-prefixed identifier.
         assert!(error("$where = 1").contains("unexpected character '$'"));
+        // Structural garbage after the grammar ends.
+        assert!(error("n = 1) and flag = true").contains("expected end of filter"));
+        assert!(error("n = 1 and (").contains("expected a field name"));
+        assert!(error("n = 1 and (x = 2").contains("expected ')'"));
+        assert!(error("n = 1 and ()").contains("empty '(...)' group"));
+        // Unary `not` stays an explicit protocol refusal.
+        assert!(error("not flag = true").contains("'not' is not supported"));
+        assert!(error("n = 1 and not flag = true").contains("'not' is not supported"));
+    }
+
+    const MANY_PARENS: &str = "((((((((((((((((n = 1))))))))))))))))";
+    const TOO_MANY_PARENS: &str = "(((((((((((((((((n = 1))))))))))))))))"; // 17
+
+    #[test]
+    fn groups_nest_up_to_the_cap_and_not_one_more() {
+        assert_eq!(parse(MANY_PARENS), vec![("n".to_owned(), Bson::Int32(1))]);
+        assert!(error(TOO_MANY_PARENS).contains("nest deeper than 16"));
     }
 
     #[test]

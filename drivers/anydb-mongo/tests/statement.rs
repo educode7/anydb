@@ -152,19 +152,36 @@ fn source_for(port: u16) -> impl Future<Output = std::sync::Arc<WireDataSource>>
 
 // ---------- server-side matcher (only what the scripts exercise) -------
 
-/// `$`-keys of the operator document apply conjunctively; a scalar
-/// condition is equality (mongo's natural shorthand).
+/// Top-level `$or`/`$and` keys are mongo's connective operators; any
+/// other key applies its operator condition to the field value. A
+/// scalar condition is equality (mongo's natural shorthand).
 fn matches_filter(filter: &Document, document: &Document) -> bool {
-    filter.iter().all(|(path, condition)| {
-        let value = field_value(document, path);
-        match condition {
-            Bson::Document(operators) => {
-                !operators.is_empty()
-                    && operators
-                        .iter()
-                        .all(|(op, operand)| match_op(op, value, operand))
+    filter.iter().all(|(path, condition)| match path.as_str() {
+        "$or" => match condition {
+            Bson::Array(branches) => branches.iter().any(|branch| match branch {
+                Bson::Document(branch_document) => matches_filter(branch_document, document),
+                _ => false,
+            }),
+            _ => false,
+        },
+        "$and" => match condition {
+            Bson::Array(branches) => branches.iter().all(|branch| match branch {
+                Bson::Document(branch_document) => matches_filter(branch_document, document),
+                _ => false,
+            }),
+            _ => false,
+        },
+        _ => {
+            let value = field_value(document, path);
+            match condition {
+                Bson::Document(operators) => {
+                    !operators.is_empty()
+                        && operators
+                            .iter()
+                            .all(|(op, operand)| match_op(op, value, operand))
+                }
+                scalar => match_op("$eq", value, scalar),
             }
-            scalar => match_op("$eq", value, scalar),
         }
     })
 }
@@ -562,6 +579,63 @@ async fn boolean_params_filter_flags() {
         .await
         .expect("typed execution");
     assert_eq!(typed.rows.len(), 2);
+
+    server.await.expect("server task");
+}
+
+#[tokio::test]
+async fn or_filters_match_either_branch_server_side() {
+    let dataset = vec![
+        doc_n(1, "a", true),
+        doc_n(2, "b", false),
+        doc_n(3, "c", true),
+        doc_n(4, "d", false),
+    ];
+    let (port, server) = spawn_server(move |stream| {
+        // `tag = 'a' or (n in (2, 3) and flag = ?)` compiles to one
+        // `$or` over two branch documents; the second branch merges
+        // its `in` and flag conditions conjunctively.
+        filter_find_server(
+            stream,
+            Bson::Document(vec![(
+                "$or".to_owned(),
+                Bson::Array(vec![
+                    Bson::Document(vec![("tag".to_owned(), Bson::String("a".to_owned()))]),
+                    Bson::Document(vec![
+                        (
+                            "n".to_owned(),
+                            Bson::Document(vec![(
+                                "$in".to_owned(),
+                                Bson::Array(vec![Bson::Int32(2), Bson::Int32(3)]),
+                            )]),
+                        ),
+                        ("flag".to_owned(), Bson::Boolean(true)),
+                    ]),
+                ]),
+            )]),
+            dataset,
+            2,
+        )
+    });
+    let source = source_for(port).await;
+
+    let typed = source
+        .execute_statement_typed(
+            "find c1 with tag = 'a' or (n in (2, 3) and flag = ?)",
+            &[QueryParameter::Boolean(true)],
+        )
+        .await
+        .expect("typed execution");
+    // Branch 1 keeps n=1; branch 2 keeps n=3 (n=2 fails the flag).
+    let numbers: Vec<i32> = typed
+        .rows
+        .iter()
+        .map(|row| match &row[0] {
+            Some(TypedValue::Int4(n)) => *n,
+            other => panic!("unexpected number value {other:?}"),
+        })
+        .collect();
+    assert_eq!(numbers, vec![1, 3], "each branch contributes its matches");
 
     server.await.expect("server task");
 }
