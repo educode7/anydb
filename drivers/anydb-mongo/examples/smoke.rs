@@ -14,7 +14,9 @@
 //! db.anydb_smoke.insertMany([
 //!   {n:1,tag:'a',flag:true},{n:2,tag:'a',flag:false},
 //!   {n:3,tag:'b',flag:true},{n:4,tag:'b',flag:false},
-//!   {n:5,tag:'c',flag:true},{n:6,tag:'c',flag:false}]);"
+//!   {n:5,tag:'c',flag:true},{n:6,tag:'c',flag:false},
+//!   {n:7,tag:'dec',flag:true,price:NumberDecimal('123.456'),ts:Timestamp(1735689600,5)},
+//!   {n:8,tag:'dec',flag:false,price:NumberDecimal('NaN'),ts:Timestamp(1,1)}]);"
 //! ```
 
 use anydb_mongo::MongoDriver;

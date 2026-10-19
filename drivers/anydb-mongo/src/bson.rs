@@ -33,12 +33,252 @@ pub enum Bson {
     Boolean(bool),
     /// Milliseconds since the Unix epoch.
     DateTime(i64),
+    /// Mongo oplog timestamp: seconds since the epoch plus a monotonic
+    /// increment within that second.
+    Timestamp {
+        seconds: u32,
+        increment: u32,
+    },
+    /// `decimal128` decoded to its decimal value object (IEEE 754-2008
+    /// BID with the BSON byte layout).
+    Decimal128(Decimal128),
     Null,
     Int32(i32),
     Int64(i64),
-    /// Opaque value bytes (`timestamp`, `decimal128`): the typed surface
-    /// is `Bytea`; interpreting them is the caller's business.
-    Opaque(Vec<u8>),
+}
+
+/// A decoded `decimal128` (dependency-free): sign, significand digits
+/// and the unbiased exponent — exactly what the wire carries, in the
+/// mongo canonical string shape (fixed notation when `-6 <= adjusted`,
+/// scientific otherwise; `NaN` / `Infinity` for specials).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Decimal128 {
+    pub negative: bool,
+    /// Significand digits without leading zeros (`"0"` for zero);
+    /// significant trailing zeros are preserved (`"10"` renders `1.0`).
+    pub digits: String,
+    /// Unbiased exponent (biased field minus 6176).
+    pub exponent: i32,
+}
+
+impl Decimal128 {
+    /// Canonical mongo render (the `NumberDecimal(...)` payload), with
+    /// the exact rules observed on a live mongod 7.0: exponent 0 renders
+    /// the digits as-is, a positive exponent is always scientific
+    /// (`1E+2`, `1.23E+5`), and a negative one is fixed while the
+    /// adjusted exponent stays at or above `-6` (`0.00001`, `1.0`),
+    /// scientific below it (`1E-7`). Zeros keep their scale (`0.0`).
+    pub fn canonical(&self) -> String {
+        if self.digits == "NaN" || self.digits == "Infinity" {
+            let mut out = String::new();
+            if self.negative {
+                out.push('-');
+            }
+            out.push_str(&self.digits);
+            return out;
+        }
+        let mut out = String::new();
+        if self.negative {
+            out.push('-');
+        }
+        let digits = &self.digits;
+        let adjusted = self.exponent + digits.len() as i32 - 1;
+        if self.exponent == 0 {
+            out.push_str(digits);
+        } else if self.exponent > 0 || adjusted < -6 {
+            // Scientific: first digit, optional rest, signed adjusted
+            // exponent.
+            out.push_str(&digits[..1]);
+            if digits.len() > 1 {
+                out.push('.');
+                out.push_str(&digits[1..]);
+            }
+            out.push('E');
+            if adjusted >= 0 {
+                out.push('+');
+            }
+            out.push_str(&adjusted.to_string());
+        } else {
+            // Fixed with the decimal point inside or before the digits.
+            let point = digits.len() as i32 + self.exponent;
+            if point <= 0 {
+                out.push_str("0.");
+                for _ in 0..(-point) {
+                    out.push('0');
+                }
+                out.push_str(digits);
+            } else {
+                out.push_str(&digits[..point as usize]);
+                out.push('.');
+                out.push_str(&digits[point as usize..]);
+            }
+        }
+        out
+    }
+}
+
+/// Parses the canonical decimal text into a `Decimal128` (specials and
+/// plain/scientific forms; the inverse of `Decimal128::canonical`).
+pub fn parse_decimal128(text: &str) -> Result<Decimal128, ConnectionError> {
+    let (negative, text) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text.strip_prefix('+').unwrap_or(text)),
+    };
+    parse_positive(text, negative)
+}
+
+fn parse_positive(text: &str, negative: bool) -> Result<Decimal128, ConnectionError> {
+    // NaN / Infinity first.
+    if text == "NaN" || text == "Infinity" {
+        return Ok(Decimal128 {
+            negative,
+            digits: text.to_owned(),
+            exponent: 0,
+        });
+    }
+    let invalid = || ConnectionError::Protocol(format!("invalid decimal128 literal '{text}'"));
+    let (mantissa, exponent) = match text.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => (mantissa, exponent.parse::<i32>().map_err(|_| invalid())?),
+        None => (text, 0),
+    };
+    let (integer, fraction) = match mantissa.split_once('.') {
+        Some((integer, fraction)) => (integer, fraction),
+        None => (mantissa, ""),
+    };
+    if integer.is_empty() && fraction.is_empty() {
+        return Err(invalid());
+    }
+    if !integer.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(invalid());
+    }
+    let digits: String = integer.chars().chain(fraction.chars()).collect();
+    // Trim leading zeros; a significand of only zeros is the zero value.
+    let exponent = exponent - fraction.len() as i32;
+    match digits.bytes().position(|byte| byte != b'0') {
+        Some(position) => {
+            let digits = &digits[position..];
+            if digits.len() > 34 {
+                return Err(protocol(format!(
+                    "decimal128 significand '{}' exceeds 34 digits",
+                    digits.len()
+                )));
+            }
+            Ok(Decimal128 {
+                negative,
+                digits: digits.to_owned(),
+                exponent,
+            })
+        }
+        // Zero: one significant digit, sign and scale preserved
+        // (`-0` and `0.0` render exactly as stored).
+        None => Ok(Decimal128 {
+            negative,
+            digits: "0".to_owned(),
+            exponent,
+        }),
+    }
+}
+
+/// The decimal128 exponent bias (`Emin = -6176`).
+const DECIMAL128_BIAS: i32 = 6176;
+
+/// Decodes the 16 wire bytes of a `decimal128`. Layout verified against
+/// a live mongod 7.0 (byte order per the BSON decimal128 spec):
+/// `b15` = sign bit 7 + biased exponent bits 13..7, `b14` bits 7..1 =
+/// biased exponent bits 6..0 and bit 0 = coefficient bit 112, and
+/// `b13..b0` = the remaining coefficient bits (little endian). Exponent
+/// bias 6176; the coefficient is an integer of at most 34 decimal
+/// digits. Top exponent bits mark the specials: biased field
+/// `0x7C..` = NaN (payload ignored), `0x78..` = Infinity — the inverse
+/// of the IEEE MSB-first bit numbering.
+fn decimal128_decode(bytes: &[u8]) -> Result<Decimal128, ConnectionError> {
+    let low = u64::from_le_bytes(bytes[0..8].try_into().expect("8 bytes"));
+    let high = u64::from_le_bytes(bytes[8..16].try_into().expect("8 bytes"));
+    let negative = (high >> 63) & 1 == 1;
+    if (high >> 59) & 0x0F == 0x0F {
+        let digits = if (high >> 58) & 1 == 1 {
+            "NaN"
+        } else {
+            "Infinity"
+        };
+        return Ok(Decimal128 {
+            negative,
+            digits: digits.to_owned(),
+            exponent: 0,
+        });
+    }
+
+    let biased = (((high >> 56) & 0x7F) << 7) as i32 | ((high >> 49) & 0x7F) as i32;
+    if biased > DECIMAL128_BIAS + 6111 {
+        return Err(protocol(format!(
+            "decimal128 exponent field out of range ({biased})"
+        )));
+    }
+    let significand = (((high >> 48) & 1) as u128) << 112
+        | (((high & 0xFFFF_FFFF_FFFF) as u128) << 64)
+        | low as u128;
+    let digits = significand.to_string();
+    if digits.len() > 34 {
+        return Err(protocol(format!(
+            "decimal128 significand '{digits}' exceeds 34 digits"
+        )));
+    }
+    Ok(Decimal128 {
+        negative,
+        digits,
+        exponent: biased - DECIMAL128_BIAS,
+    })
+}
+
+/// Encodes a `Decimal128` back to its 16 wire bytes (the round-trip
+/// inverse of `decimal128_decode`).
+fn decimal128_encode(value: &Decimal128) -> Result<[u8; 16], ConnectionError> {
+    if value.digits == "NaN" {
+        let high = 0x7C00_0000_0000_0000 | ((value.negative as u64) << 63);
+        return Ok(le_bytes16(0, high));
+    }
+    if value.digits == "Infinity" {
+        let high = 0x7800_0000_0000_0000 | ((value.negative as u64) << 63);
+        return Ok(le_bytes16(0, high));
+    }
+    let significand = value
+        .digits
+        .parse::<u128>()
+        .map_err(|_| protocol(format!("invalid decimal128 significand '{}'", value.digits)))?;
+    if significand > 9_999_999_999_999_999_999_999_999_999_999_999u128 {
+        return Err(protocol(format!(
+            "decimal128 significand '{}' exceeds 34 digits",
+            value.digits
+        )));
+    }
+    let biased = value.exponent + DECIMAL128_BIAS;
+    let biased = u32::try_from(biased)
+        .ok()
+        .filter(|biased| (0..=(DECIMAL128_BIAS + 6111) as u32).contains(biased))
+        .ok_or_else(|| {
+            protocol(format!(
+                "decimal128 exponent {} out of range",
+                value.exponent
+            ))
+        })?;
+    // The significand spans high(49: bits 64..112) + low(64) bits; the
+    // exponent field and the coefficient's top bit share the top word.
+    let high = (((biased >> 7) as u64 & 0x7F) << 56)
+        | (((biased & 0x7F) as u64) << 49)
+        | (((significand >> 112) as u64 & 1) << 48)
+        | ((significand >> 64) as u64 & 0xFFFF_FFFF_FFFF)
+        | ((value.negative as u64) << 63);
+    let low = significand as u64;
+    Ok(le_bytes16(low, high))
+}
+
+fn le_bytes16(low: u64, high: u64) -> [u8; 16] {
+    let mut bytes = [0u8; 16];
+    bytes[0..8].copy_from_slice(&low.to_le_bytes());
+    bytes[8..16].copy_from_slice(&high.to_le_bytes());
+    bytes
 }
 
 /// A parsed BSON document in field order.
@@ -159,9 +399,20 @@ impl<'a> Reader<'a> {
             0x09 => Ok(Bson::DateTime(self.i64_le()?)),
             0x0A => Ok(Bson::Null),
             0x10 => Ok(Bson::Int32(self.i32_le()?)),
-            0x11 => Ok(Bson::Opaque(self.take(8)?.to_vec())),
+            0x11 => {
+                // increment first, then the seconds since the epoch
+                // (verified against a live mongod).
+                let bytes = self.take(8)?;
+                Ok(Bson::Timestamp {
+                    seconds: u32::from_le_bytes(bytes[4..8].try_into().expect("4 bytes")),
+                    increment: u32::from_le_bytes(bytes[0..4].try_into().expect("4 bytes")),
+                })
+            }
             0x12 => Ok(Bson::Int64(self.i64_le()?)),
-            0x13 => Ok(Bson::Opaque(self.take(16)?.to_vec())),
+            0x13 => {
+                let bytes = self.take(16)?;
+                Ok(Bson::Decimal128(decimal128_decode(bytes)?))
+            }
             other => Err(protocol(format!("unsupported type {other:#06x}"))),
         }
     }
@@ -248,10 +499,11 @@ pub fn typed_value(value: &Bson) -> Option<TypedValue> {
         Bson::ObjectId(object_id) => Some(TypedValue::Text(object_id_hex(object_id))),
         Bson::Boolean(value) => Some(TypedValue::Boolean(*value)),
         Bson::DateTime(millis) => Some(TypedValue::Text(iso8601(*millis))),
+        Bson::Timestamp { .. } => Some(TypedValue::Text(render(value))),
+        Bson::Decimal128(value) => Some(TypedValue::BigDecimal(value.canonical())),
         Bson::Null => None,
         Bson::Int32(value) => Some(TypedValue::Int4(*value)),
         Bson::Int64(value) => Some(TypedValue::Int8(*value)),
-        Bson::Opaque(bytes) => Some(TypedValue::Bytea(bytes.clone())),
     }
 }
 
@@ -363,10 +615,21 @@ fn render_into(value: &Bson, out: &mut String) {
             out.push_str(&iso8601(*millis));
             out.push_str("\"}");
         }
+        Bson::Timestamp { seconds, increment } => {
+            out.push_str("{\"$timestamp\": {\"t\": ");
+            out.push_str(&seconds.to_string());
+            out.push_str(", \"i\": ");
+            out.push_str(&increment.to_string());
+            out.push_str("}}");
+        }
+        Bson::Decimal128(value) => {
+            out.push_str("{\"$numberDecimal\": \"");
+            out.push_str(&value.canonical());
+            out.push_str("\"}");
+        }
         Bson::Null => out.push_str("null"),
         Bson::Int32(number) => out.push_str(&number.to_string()),
         Bson::Int64(number) => out.push_str(&number.to_string()),
-        Bson::Opaque(bytes) => out.push_str(&TypedValue::Bytea(bytes.clone()).to_string()),
     }
 }
 
@@ -459,13 +722,15 @@ fn write_fields(document: &Document, out: &mut Vec<u8>) -> Result<(), Connection
             Bson::String(_) => 0x02,
             Bson::Document(_) => 0x03,
             Bson::Array(_) => 0x04,
-            Bson::Binary(_) | Bson::Opaque(_) => 0x05,
+            Bson::Binary(_) => 0x05,
             Bson::ObjectId(_) => 0x07,
             Bson::Boolean(_) => 0x08,
             Bson::DateTime(_) => 0x09,
             Bson::Null => 0x0A,
             Bson::Int32(_) => 0x10,
+            Bson::Timestamp { .. } => 0x11,
             Bson::Int64(_) => 0x12,
+            Bson::Decimal128(_) => 0x13,
         };
         out.push(type_code);
         out.extend_from_slice(key.as_bytes());
@@ -504,7 +769,7 @@ fn write_value(value: &Bson, out: &mut Vec<u8>) -> Result<(), ConnectionError> {
                 .collect();
             out.extend_from_slice(&encode_document(&indexed)?);
         }
-        Bson::Binary(bytes) | Bson::Opaque(bytes) => {
+        Bson::Binary(bytes) => {
             let length =
                 i32::try_from(bytes.len()).map_err(|_| protocol("binary too large".to_owned()))?;
             out.extend_from_slice(&length.to_le_bytes());
@@ -514,6 +779,15 @@ fn write_value(value: &Bson, out: &mut Vec<u8>) -> Result<(), ConnectionError> {
         Bson::ObjectId(bytes) => out.extend_from_slice(bytes),
         Bson::Boolean(value) => out.push(u8::from(*value)),
         Bson::DateTime(millis) => out.extend_from_slice(&millis.to_le_bytes()),
+        Bson::Timestamp { seconds, increment } => {
+            // Wire order verified against a live mongod: increment
+            // first, then the seconds.
+            out.extend_from_slice(&increment.to_le_bytes());
+            out.extend_from_slice(&seconds.to_le_bytes());
+        }
+        Bson::Decimal128(value) => {
+            out.extend_from_slice(&decimal128_encode(value)?);
+        }
         Bson::Null => {}
         Bson::Int32(number) => out.extend_from_slice(&number.to_le_bytes()),
         Bson::Int64(number) => out.extend_from_slice(&number.to_le_bytes()),
@@ -890,5 +1164,193 @@ mod tests {
             Bson::Array(values) => assert_eq!(values, &vec![Bson::Int32(1), Bson::Int32(2)]),
             other => panic!("expected array, got {other:?}"),
         }
+    }
+
+    /// Byte patterns captured from a live mongod 7.0 by inserting
+    /// `NumberDecimal` literals through the shell and hex-dumping the
+    /// find reply (examples/probe.rs); each entry is (wire bytes,
+    /// expected canonical text).
+    fn oracle_decimals() -> Vec<(Vec<u8>, &'static str)> {
+        vec![
+            (hex("01000000000000000000000000004030"), "1"),
+            (hex("010000000000000000000000000040B0"), "-1"),
+            (hex("40E20100000000000000000000003A30"), "123.456"),
+            (hex("0F000000000000000000000000003E30"), "1.5"),
+            (hex("01000000000000000000000000004430"), "1E+2"),
+            (hex("010000000000000000000000000036B0"), "-0.00001"),
+            (hex("01000000000000000000000000000831"), "1E+100"),
+            (hex("00000000000000000000000000004030"), "0"),
+            (hex("000000000000000000000000000040B0"), "-0"),
+            (hex("00000000000000000000000000003E30"), "0.0"),
+            (hex("00000000000000000000000000003EB0"), "-0.0"),
+            (hex("CE040000000000000000000000004030"), "1230"),
+            (hex("7B000000000000000000000000004630"), "1.23E+5"),
+            (hex("05000000000000000000000000003E30"), "0.5"),
+            (hex("0A000000000000000000000000003E30"), "1.0"),
+            (hex("01000000000000000000000000003230"), "1E-7"),
+            (hex("CE040000000000000000000000003E30"), "123.0"),
+            (hex("00000000000000000000000000003630"), "0.00000"),
+            (hex("0000000000000000000000000000007C"), "NaN"),
+            (hex("00000000000000000000000000000078"), "Infinity"),
+            (hex("000000000000000000000000000000F8"), "-Infinity"),
+        ]
+    }
+
+    fn hex(text: &str) -> Vec<u8> {
+        let text: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+        (0..text.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&text[index..index + 2], 16).expect("hex"))
+            .collect()
+    }
+
+    #[test]
+    fn decodes_decimal128_byte_patterns_captured_from_a_live_server() {
+        for (bytes, expected) in oracle_decimals() {
+            let input = test_document(vec![test_field(0x13, "x", bytes)]);
+            let document = parse_document(&input).expect("parse");
+            match &document[0].1 {
+                Bson::Decimal128(value) => {
+                    assert_eq!(value.canonical(), expected, "canonical mismatch");
+                }
+                other => panic!("expected Decimal128, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn typed_surface_carries_decimals_and_timestamps() {
+        let value = parse_decimal128("123.456").expect("parse");
+        assert_eq!(
+            typed_value(&Bson::Decimal128(value)),
+            Some(TypedValue::BigDecimal("123.456".to_owned()))
+        );
+        assert_eq!(
+            typed_value(&Bson::Timestamp {
+                seconds: 1_735_689_600,
+                increment: 5,
+            }),
+            Some(TypedValue::Text(
+                "{\"$timestamp\": {\"t\": 1735689600, \"i\": 5}}".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn timestamps_use_the_increment_first_wire_order() {
+        // Timestamp(1735689600, 5) hex-dumped from a live mongod.
+        let bytes = hex("0500000080857467");
+        let input = test_document(vec![test_field(0x11, "ts", bytes.clone())]);
+        let document = parse_document(&input).expect("parse");
+        match &document[0].1 {
+            Bson::Timestamp { seconds, increment } => {
+                assert_eq!(*seconds, 1_735_689_600);
+                assert_eq!(*increment, 5);
+            }
+            other => panic!("expected Timestamp, got {other:?}"),
+        }
+        let encoded = encode_document(&Document::from(vec![(
+            "ts".to_owned(),
+            Bson::Timestamp {
+                seconds: 1_735_689_600,
+                increment: 5,
+            },
+        )]))
+        .expect("encode");
+        assert_eq!(
+            &encoded[8..16],
+            &bytes[..],
+            "wire order: increment, seconds"
+        );
+    }
+
+    #[test]
+    fn decimal128_round_trips_through_the_wire_bytes() {
+        let values = [
+            "1",
+            "-1",
+            "0",
+            "-0",
+            "0.0",
+            "0.00000",
+            "0E+5",
+            "1E+2",
+            "1.23E+5",
+            "123.456",
+            "1.5",
+            "1E-7",
+            "123.0",
+            "1230",
+            "1E+100",
+            "1E-6176",
+            "1E+6111",
+            "9.9999E+6111",
+            "9999999999999999999999999999999999",
+            "1.234567890123456789012345678901234",
+            "NaN",
+            "Infinity",
+            "-Infinity",
+            "-NaN",
+        ];
+        for text in values {
+            let value = parse_decimal128(text).expect("parse");
+            let bytes = decimal128_encode(&value).expect("encode");
+            let decoded = decimal128_decode(&bytes).expect("decode");
+            assert_eq!(decoded, value, "round trip of {text}");
+            assert_eq!(decoded.canonical(), value.canonical(), "render of {text}");
+        }
+    }
+
+    #[test]
+    fn decimal128_rejects_oversized_coefficients_and_exponents() {
+        assert!(
+            parse_decimal128("1.2345678901234567890123456789012345").is_err(),
+            "35 digits"
+        );
+        assert!(
+            decimal128_encode(&Decimal128 {
+                negative: false,
+                digits: "1".to_owned(),
+                exponent: 6112,
+            })
+            .is_err(),
+            "exponent above Emax"
+        );
+        // biased 14336 (> 12287): finite layout with an out-of-range
+        // exponent field.
+        let bytes = hex("00000000000000000000000000004070");
+        let input = test_document(vec![test_field(0x13, "x", bytes)]);
+        assert!(parse_document(&input).is_err(), "exponent field range");
+    }
+
+    #[test]
+    fn decimal128_documents_round_trip_end_to_end() {
+        let document = Document::from(vec![
+            (
+                "price".to_owned(),
+                Bson::Decimal128(parse_decimal128("123.456").expect("parse")),
+            ),
+            (
+                "ts".to_owned(),
+                Bson::Timestamp {
+                    seconds: 1_735_689_600,
+                    increment: 5,
+                },
+            ),
+        ]);
+        let encoded = encode_document(&document).expect("encode");
+        let reparsed = parse_document(&encoded).expect("reparsed");
+        assert_eq!(reparsed, document);
+        assert_eq!(
+            render(&Bson::Decimal128(parse_decimal128("1.5").expect("parse"))),
+            "{\"$numberDecimal\": \"1.5\"}"
+        );
+        assert_eq!(
+            render(&Bson::Timestamp {
+                seconds: 1_735_689_600,
+                increment: 5,
+            }),
+            "{\"$timestamp\": {\"t\": 1735689600, \"i\": 5}}"
+        );
     }
 }

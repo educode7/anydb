@@ -68,6 +68,12 @@ pub enum TypedValue {
     Float4(f32),
     Float8(f64),
     Text(String),
+    /// Arbitrary-precision decimal carried as canonical decimal TEXT
+    /// (the DBeaver `BigDecimal` analog): mongo `decimal128` values,
+    /// and Postgres `numeric` when the typed surface adopts it. Text is
+    /// the lossless carrier — 34-digit significands survive `Float8`
+    /// roundings only by never going through it.
+    BigDecimal(String),
     /// Opaque driver-native bytes (Postgres: `bytea`).
     Bytea(Vec<u8>),
 }
@@ -82,6 +88,7 @@ impl std::fmt::Display for TypedValue {
             Self::Float4(value) => write!(f, "{}", float_text(*value as f64)),
             Self::Float8(value) => write!(f, "{}", float_text(*value)),
             Self::Text(value) => write!(f, "{value}"),
+            Self::BigDecimal(value) => write!(f, "{value}"),
             Self::Bytea(bytes) => {
                 write!(f, "\\x")?;
                 for byte in bytes {
