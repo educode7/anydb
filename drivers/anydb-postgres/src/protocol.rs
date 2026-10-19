@@ -635,13 +635,17 @@ async fn handle_auth<S: AsyncWrite + Unpin>(
                 ));
             }
             let client = ScramClient::new(&password);
-            let sparse_len = client.client_first_bare().len() as i32;
+            // The initial response is `n,,` + bare (gs2 header first);
+            // its declared length must count the header too — postgres
+            // reads EXACTLY that many bytes and rejects mismatches with
+            // `FATAL: invalid message format` (verified against 16.15).
+            let initial = format!("n,,{}", client.client_first_bare());
+            let initial_len = initial.len() as i32;
             let mut message = Vec::new();
             message.extend_from_slice(auth::SASL_MECHANISM.as_bytes());
             message.push(0);
-            message.extend_from_slice(&sparse_len.to_be_bytes());
-            message.extend_from_slice(b"n,,");
-            message.extend_from_slice(client.client_first_bare().as_bytes());
+            message.extend_from_slice(&initial_len.to_be_bytes());
+            message.extend_from_slice(initial.as_bytes());
             write_message(stream, b'p', &message).await?;
             *scram = Some(client);
         }
