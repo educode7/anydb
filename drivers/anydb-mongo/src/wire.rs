@@ -1,14 +1,14 @@
 //! Mongo wire client over OP_MSG: `hello` handshake (_learned_
-//! `saslSupportedMechs`), SCRAM authentication, one-shot `find` and
-//! `ping`. One `Connection` drives exactly one transport (plain TCP or
-//! rustls TLS started from the first byte); concurrency is serialized
-//! one level up (the driver facade's tokio mutex), so all methods take
-//! `&mut self`.
+//! `saslSupportedMechs`), SCRAM authentication, one-shot `find`,
+//! `ping` and cursor-id batch paging. One `Connection` drives exactly
+//! one transport (plain TCP or rustls TLS started from the first
+//! byte); concurrency is serialized one level up (the driver facade's
+//! tokio mutex), so all methods take `&mut self`.
 //!
 //! Deliberate scope: `ssl_mode` is only `disable`/`require` (mongo has
 //! no negotiation probe — see the `SslMode` doc), certificates are
-//! always verified, and cursors are single-batch (`singleBatch: true`)
-//! — batch resumption is the paging vertical, not this layer.
+//! always verified, and paging keeps exactly one live cursor, killing
+//! it best-effort on abandon (server TTL is the last resort).
 
 use std::pin::Pin;
 use std::task::{Context as TaskContext, Poll};
@@ -21,11 +21,12 @@ use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, RootCertStore};
 
-use crate::bson::{Bson, Document};
+use crate::bson::{self, Bson, Document};
 use crate::op_msg::OpMsg;
 use crate::scram::{Mechanism, ScramClient};
 use crate::uri::{MongoTarget, SslMode};
 use anydb_shared::ConnectionError;
+use anydb_shared::driver::statement::TypedStatementResult;
 
 fn protocol(message: String) -> ConnectionError {
     ConnectionError::Protocol(format!("mongo wire: {message}"))
@@ -123,6 +124,20 @@ pub struct Connection {
     stream: NetStream,
     next_request_id: i32,
     server_version: String,
+    /// The one suspended cursor (`getMore` paging); `None` when no
+    /// paging flow is half-open. One cursor at a time keeps the state
+    /// machine as simple as the postgres portal does.
+    open_cursor: Option<OpenCursor>,
+}
+
+/// Frozen identity of a suspended cursor: the server-side id (an
+/// opaque i64), the collection for `killCursors` on abandon, and the
+/// documents fetched before the pending batch (the final `find N` tag).
+#[derive(Debug, Clone, PartialEq)]
+struct OpenCursor {
+    id: i64,
+    collection: String,
+    docs_before: i64,
 }
 
 impl Connection {
@@ -143,6 +158,7 @@ impl Connection {
             stream,
             next_request_id: 1,
             server_version: "unknown".to_owned(),
+            open_cursor: None,
         };
 
         let mut handshake = Document::from(vec![
@@ -273,47 +289,171 @@ impl Connection {
         scram.server_final(&payload)
     }
 
-    /// One-shot `find`: `singleBatch` keeps the cursor closed so the
-    /// reply is the whole answer; an open cursor id is a protocol error
-    /// (batch resumption is the paging vertical).
+    /// Fetch-all `find`: single batch, cursor closed by the server.
+    /// Internally the degenerate `limit = 0` case of `find_page_start`.
     pub async fn find(&mut self, collection: &str) -> Result<Vec<Document>, ConnectionError> {
-        let command = Document::from(vec![
+        let page = self.find_page_start(collection, 0).await?;
+        debug_assert!(!page.suspended);
+        Ok(page.documents)
+    }
+
+    /// Cursor paging (the mongo analog of the postgres portal flow):
+    /// `find` with `batchSize = limit` returns a `firstBatch`; while the
+    /// reply carries a non-zero `cursor.id` the paging flow suspends and
+    /// `find_page_continue` fetches the next batch with `getMore`. The
+    /// final (drained) batch completes the flow.
+    ///
+    /// `limit = 0` degenerates to fetch-all (`singleBatch: true`, the
+    /// exact server semantics of "no cursor"): there is no postgres
+    /// `Execute(0)` analog because the server default batch size would
+    /// suspend anyway.
+    pub async fn find_page_start(
+        &mut self,
+        collection: &str,
+        limit: i32,
+    ) -> Result<CursorPage, ConnectionError> {
+        if limit < 0 {
+            return Err(protocol("negative batch size limit".to_owned()));
+        }
+        // An abandoned suspended cursor is killed best-effort before a
+        // new flow starts (unlike the postgres abandoned portal, a
+        // rejected killCursors cannot desynchronize the request/reply
+        // framing, so only wire failures propagate).
+        self.close_open_cursor().await?;
+
+        let mut command = Document::from(vec![
             ("find".to_owned(), Bson::String(collection.to_owned())),
             ("filter".to_owned(), Bson::Document(Document::new())),
-            ("singleBatch".to_owned(), Bson::Boolean(true)),
         ]);
+        if limit == 0 {
+            // Fetch-all: one batch, server closes the cursor.
+            command.push(("singleBatch".to_owned(), Bson::Boolean(true)));
+        } else {
+            command.push(("batchSize".to_owned(), Bson::Int32(limit)));
+        }
         let reply = self.command(&command).await?;
-        let Some((_, Bson::Document(cursor))) = reply.iter().find(|(key, _)| key == "cursor")
-        else {
-            return Err(protocol("find reply lacks a cursor document".to_owned()));
-        };
-        let cursor_id = cursor
-            .iter()
-            .find(|(key, _)| key == "id")
-            .map(|(_, value)| value);
-        let open_cursor = match cursor_id {
-            Some(Bson::Int64(0)) | Some(Bson::Int32(0)) | Some(Bson::Double(0.0)) => None,
-            Some(other) => Some(other.clone()),
-            None => None,
-        };
-        if let Some(id) = open_cursor {
+        let cursor = parse_cursor(&reply, "find", "firstBatch")?;
+        let documents = batch_documents(&cursor.batch, "firstBatch")?;
+        let collected = i64::try_from(documents.len())
+            .map_err(|_| protocol("batch size exceeds i64".to_owned()))?;
+        if cursor.id != 0 && limit == 0 {
+            // A server violating singleBatch (or an unsupported legacy
+            // behavior): the one-shot contract has no cursor to track.
             return Err(protocol(format!(
-                "find returned an open cursor ({id:?}): batch resumption is not supported yet"
+                "singleBatch find returned an open cursor ({:#x})",
+                cursor.id
             )));
         }
-        let Some((_, Bson::Array(batch))) = cursor.iter().find(|(key, _)| key == "firstBatch")
-        else {
-            return Err(protocol("cursor lacks a firstBatch array".to_owned()));
+        if cursor.id == 0 {
+            return Ok(CursorPage {
+                documents,
+                suspended: false,
+                total: collected,
+            });
+        }
+        self.open_cursor = Some(OpenCursor {
+            id: cursor.id,
+            collection: collection.to_owned(),
+            docs_before: collected,
+        });
+        Ok(CursorPage {
+            documents,
+            suspended: true,
+            total: collected,
+        })
+    }
+
+    /// Fetches the next batch of the suspended cursor via `getMore`;
+    /// a drained reply (cursor id back to 0) completes the flow and
+    /// releases the local cursor state. Errors when no paging flow is
+    /// half-open. The batch size is fixed at `find_page_start`: mongo
+    /// `getMore` allows re-sizing but the streaming contract stays
+    /// constant (unlike the postgres `Execute` whose per-call limit is
+    /// protocol-mandatory).
+    pub async fn find_page_continue(&mut self) -> Result<CursorPage, ConnectionError> {
+        let open = self
+            .open_cursor
+            .clone()
+            .ok_or_else(|| protocol("no suspended cursor".to_owned()))?;
+        let command = Document::from(vec![
+            ("getMore".to_owned(), Bson::Int64(open.id)),
+            (
+                "collection".to_owned(),
+                Bson::String(open.collection.clone()),
+            ),
+        ]);
+        let reply = match self.command(&command).await {
+            Ok(reply) => reply,
+            Err(error) => {
+                // A failed flow clears the local state: the wire survived
+                // (the error is mapped and carries no residual framing),
+                // and the abandoned server cursor dies by TTL expiry.
+                // The next start cannot kill what it does not track —
+                // documented tradeoff of the best-effort policy.
+                self.open_cursor = None;
+                return Err(error);
+            }
         };
-        batch
-            .iter()
-            .map(|document| match document {
-                Bson::Document(document) => Ok(document.clone()),
-                other => Err(protocol(format!(
-                    "batch entry is not a document: {other:?}"
-                ))),
-            })
-            .collect()
+        let cursor = parse_cursor(&reply, "getMore", "nextBatch")?;
+        // Mongo continuity: the reply keeps the same cursor id while the
+        // cursor stays open, and DRAINS it to 0 on the final (drained)
+        // batch; anything else is a protocol violation.
+        if cursor.id != open.id && cursor.id != 0 {
+            self.open_cursor = None;
+            return Err(protocol(format!(
+                "getMore returned cursor id {:#x} while {:#x} was suspended",
+                cursor.id, open.id
+            )));
+        }
+        let documents = batch_documents(&cursor.batch, "nextBatch")?;
+        let batch = i64::try_from(documents.len())
+            .map_err(|_| protocol("batch size exceeds i64".to_owned()))?;
+        let total = open.docs_before + batch;
+        if cursor.id == 0 {
+            self.open_cursor = None;
+            return Ok(CursorPage {
+                documents,
+                suspended: false,
+                total,
+            });
+        }
+        self.open_cursor = Some(OpenCursor {
+            docs_before: total,
+            ..open
+        });
+        Ok(CursorPage {
+            documents,
+            suspended: true,
+            total,
+        })
+    }
+
+    /// Kills the suspended cursor, if any. Best-effort for command-level
+    /// failures (the server TTL expiry collects an abandoned cursor
+    /// anyway); wire-level failures propagate, they mean a dead
+    /// transport.
+    async fn close_open_cursor(&mut self) -> Result<(), ConnectionError> {
+        let Some(open) = self.open_cursor.take() else {
+            return Ok(());
+        };
+        let command = Document::from(vec![
+            ("killCursors".to_owned(), Bson::String(open.collection)),
+            (
+                "cursors".to_owned(),
+                Bson::Array(vec![Bson::Int64(open.id)]),
+            ),
+        ]);
+        // Command failure (dead id, namespace mismatch) leaves no wire
+        // residue: swallow it; every other error class still aborts.
+        if let Err(error) = self.command(&command).await
+            && !matches!(
+                error,
+                ConnectionError::ExecutionFailed { .. } | ConnectionError::Protocol(_)
+            )
+        {
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Keepalive command (`{ping: 1}`), the whole driver surface the
@@ -323,9 +463,107 @@ impl Connection {
         self.command(&command).await.map(|_| ())
     }
 
-    /// Closes the TCP stream: drop-based; mongo has no close
-    /// acknowledge like the postgres X message.
-    pub async fn terminate(self) {}
+    /// Closes the transport: best-effort cursor kill first (mongo has
+    /// no close acknowledge like the postgres X message).
+    pub async fn terminate(mut self) {
+        let _ = self.close_open_cursor().await;
+    }
+}
+
+/// One batch of a cursor-paged find (the mongo analog of the postgres
+/// `TypedPage`): the raw documents of this batch, whether the cursor
+/// stays suspended for a `find_page_continue`, and the number of
+/// documents collected SO FAR including this batch (the typed surface
+/// renders the final `find N` tag from it — mongo replies carry no
+/// server-side total like the postgres `CommandComplete`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CursorPage {
+    /// The documents of this batch only (typed rows are rendered one
+    /// level up, per batch: mongo is schemaless and unlike the postgres
+    /// portal the columns are not frozen across batches).
+    pub documents: Vec<Document>,
+    /// `true` while the cursor id is non-zero and `find_page_continue`
+    /// must be called for the next batch.
+    pub suspended: bool,
+    /// Documents collected so far including this batch.
+    pub total: i64,
+}
+
+/// Typed presentation of one paged batch (postgres `TypedPage` shape):
+/// rows through the shared `TypedValue` contract, the `find N` command
+/// tag only on the final (drained) batch.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedPage {
+    pub result: TypedStatementResult,
+    /// `true` while `query_page_continue` has more batches.
+    pub suspended: bool,
+}
+
+/// Assembles the typed view of a raw batch: per-batch columns (mongo
+/// is schemaless), command tag / affected rows only when drained.
+pub fn typed_page(page: &CursorPage) -> TypedPage {
+    let result = if page.suspended {
+        bson::documents_to_result(&page.documents, None, None)
+    } else {
+        bson::documents_to_result(
+            &page.documents,
+            Some(&format!("find {}", page.total)),
+            Some(page.total),
+        )
+    };
+    TypedPage {
+        result,
+        suspended: page.suspended,
+    }
+}
+
+/// Server-side cursor identity of a reply: the opaque id and the batch
+/// array (named `firstBatch` on find, `nextBatch` on getMore).
+struct ReplyCursor {
+    id: i64,
+    batch: Vec<Bson>,
+}
+
+fn batch_documents(batch: &[Bson], name: &str) -> Result<Vec<Document>, ConnectionError> {
+    batch
+        .iter()
+        .map(|entry| match entry {
+            Bson::Document(document) => Ok(document.clone()),
+            other => Err(protocol(format!(
+                "{name} entry is not a document: {other:?}"
+            ))),
+        })
+        .collect()
+}
+
+/// Extracts the `cursor` document of a find/getMore reply: the opaque
+/// id (Int64, with an Int32 tolerance for relaxed servers) and the
+/// batch array named `batch_name` (`firstBatch` on find, `nextBatch`
+/// on getMore).
+fn parse_cursor(
+    reply: &Document,
+    context: &str,
+    batch_name: &str,
+) -> Result<ReplyCursor, ConnectionError> {
+    let Some((_, Bson::Document(cursor))) = reply.iter().find(|(key, _)| key == "cursor") else {
+        return Err(protocol(format!("{context} reply lacks a cursor document")));
+    };
+    let id = match cursor.iter().find(|(key, _)| key == "id").map(|(_, v)| v) {
+        Some(Bson::Int64(id)) => *id,
+        Some(Bson::Int32(id)) => i64::from(*id),
+        Some(other) => return Err(protocol(format!("cursor id is not an integer: {other:?}"))),
+        None => return Err(protocol("cursor lacks an id field".to_owned())),
+    };
+    let batch = match cursor
+        .iter()
+        .find(|(key, _)| key == batch_name)
+        .map(|(_, v)| v)
+    {
+        Some(Bson::Array(batch)) => batch.clone(),
+        Some(other) => return Err(protocol(format!("cursor batch is not an array: {other:?}"))),
+        None => return Err(protocol(format!("cursor lacks a {batch_name} array"))),
+    };
+    Ok(ReplyCursor { id, batch })
 }
 
 /// Builds the rustls client config: OS roots by default, PEM file

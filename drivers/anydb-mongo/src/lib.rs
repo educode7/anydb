@@ -16,7 +16,9 @@
 //! not supported yet (a filter document language is future work); the
 //! typed mapping converts every BSON value through the shared
 //! `TypedValue` contract, with extended-JSON rendering for embedded
-//! documents and ISO-8601 text for UTC datetimes.
+//! documents and ISO-8601 text for UTC datetimes. Cursor-id batch
+//! paging (`query_page_start` / `query_page_continue`, the postgres
+//! portal-paging analog) is driver-level on purpose.
 
 use std::sync::Arc;
 
@@ -36,6 +38,16 @@ use anydb_shared::driver::statement::{QueryParameter, StatementResult, TypedStat
 
 use crate::uri::{MongoTarget, SslMode};
 use crate::wire::Connection as WireConnection;
+
+/// One typed batch of the driver-level paging surface: the mongo
+/// rendering of the postgres `TypedPage` contract (`result` plus
+/// `suspended`).
+pub type WirePage = wire::TypedPage;
+
+/// Maps a raw wire batch through the shared typed contract.
+fn typed_batch(page: &wire::CursorPage) -> WirePage {
+    wire::typed_page(page)
+}
 
 #[derive(Debug)]
 pub struct MongoDriver {
@@ -173,6 +185,35 @@ impl WireDataSource {
             Some(&format!("find {affected}")),
             Some(affected),
         ))
+    }
+
+    /// Typed driver surface of cursor paging (postgres `TypedPage`
+    /// shape). `limit = 0` degenerates to fetch-all. Each batch maps
+    /// through the shared `TypedValue` contract independently: mongo is
+    /// schemaless, so unlike the postgres portal the columns are
+    /// re-derived per batch and may legally change between batches.
+    pub async fn query_page_start(
+        &self,
+        collection: &str,
+        limit: i32,
+    ) -> Result<WirePage, ConnectionError> {
+        let mut guard = self.connection.lock().await;
+        let Some(connection) = guard.as_mut() else {
+            return Err(ConnectionError::DriverFailure);
+        };
+        let page = connection.find_page_start(collection, limit).await?;
+        Ok(typed_batch(&page))
+    }
+
+    /// Continues the suspended cursor for the next batch; see
+    /// `query_page_start`.
+    pub async fn query_page_continue(&self) -> Result<WirePage, ConnectionError> {
+        let mut guard = self.connection.lock().await;
+        let Some(connection) = guard.as_mut() else {
+            return Err(ConnectionError::DriverFailure);
+        };
+        let page = connection.find_page_continue().await?;
+        Ok(typed_batch(&page))
     }
 }
 
