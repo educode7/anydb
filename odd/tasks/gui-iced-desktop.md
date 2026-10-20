@@ -84,10 +84,10 @@ splitting them yields commits that do not compile. Test runner: `cargo test --wo
 | --- | --- | --- | --- | --- |
 | T0 | — | inline | done | worktree `iced-gui` + branch `feature/gui-iced` (no commit) |
 | T1 | S1 | inline | done | scaffold: member + iced 0.14 + main.rs |
-| T2 | S2, S5 | inline | done | `worker.rs`: `DriverFactory`, command/event loop, 5 tests |
-| T3 | S3 | inline | done | `EventSink` -> `StatusChanged`, wired at `App::new` |
-| T4 | S4 | inline | done | `main.rs`: factory by URL scheme, screen, tick drain + close |
-| T5 | S5 | inline | done | gates green; deny advisories blocked on network |
+| T2 | S2, S5 | inline | done | `affad1c` `worker.rs`: `DriverFactory`, command/event loop, 5 tests |
+| T3 | S3 | inline | done | `affad1c` `EventSink` -> `StatusChanged`, wired at `App::new` |
+| T4 | S4 | inline | done | `affad1c` `main.rs`: factory by URL scheme, screen, tick drain + close |
+| T5 | S5 | inline | done | `affad1c` gates green; deny advisories blocked on network |
 
 ## Log
 
@@ -105,8 +105,9 @@ splitting them yields commits that do not compile. Test runner: `cargo test --wo
 - L4: 5 worker tests green (fake driver, no window): connect->connected, execute->result,
   unknown-scheme -> `ExecutionFailed` before any driver, execute-before-connect ->
   client-side `ExecutionFailed` (driver never reached), shutdown terminates loop.
-- L5 (delivery): T1 committed at `4290fd8`. T2-T4 are one commit (bridge+events+screen are
-  one behavior; the doc recorded this). Risk: none of (1)-(6) — no stored data, no auth, no
+- L5 (delivery): T1 committed at `4290fd8`. T2-T4 are one commit — `affad1c`
+  "feat(desktop): bridge UI to the platform pipeline with worker and screen" (bridge+events+screen
+  are one behavior; the doc recorded this). Risk: none of (1)-(6) — no stored data, no auth, no
   public contract change, no concurrency change to existing code, no delivery path; the new
   bin is additive. Verification: own checks only (focused test + workspace suite + clippy +
   fmt + deny-local), no independent verifier needed per the Risk line. No push (human).
