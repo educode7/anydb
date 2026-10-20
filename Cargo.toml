@@ -5,6 +5,7 @@ members = [
     "systems/connections",
     "drivers/anydb-postgres",
     "drivers/anydb-mongo",
+    "apps/anydb-desktop",
 ]
 
 [workspace.package]

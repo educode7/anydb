@@ -1,0 +1,17 @@
+[package]
+name = "anydb-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anydb = { path = "../.." }
+anydb-mongo = { path = "../../drivers/anydb-mongo" }
+anydb-postgres = { path = "../../drivers/anydb-postgres" }
+async-trait = "0.1"
+iced = { version = "0.14.0", default-features = false, features = ["tokio", "debug"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
+
+[lints.rust]
+unsafe_code = "forbid"
