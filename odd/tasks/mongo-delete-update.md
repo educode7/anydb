@@ -125,6 +125,29 @@ plus the new `delete <collection> with <filter-text>` and
   typed path must fail with the seam-naming `Protocol` error while the connection stays
   usable afterwards.
 
+### S9 — `update one` (iteration 3)
+
+Living image of S7, in the update surface: `update one <collection> with <filter-text> set
+<json-document>` sends `multi: false` — at most the FIRST matching document (server order)
+is touched; everything else (filter compile + `?` binding, `u` verbatim, upsert false,
+ordinary-path reachability, tag `update <nModified>`, arity contract, form-hint errors) is
+byte-identical to the plain form, with `one` RESERVED right after `update` for the same
+reason S7 reserved it for `delete`.
+
+Live-semantics evidence (mongo 7.0, two wires, mongosh included): with `multi:false` the
+server stops at the limit and the reply's `n` counts the documents it processed (1), not the
+full match set — "n: 1, nModified: 1" for a two-match filter; mongosh renders the same as
+`matchedCount: 1`. The acceptance therefore renders the reply verbatim; the surgical clip is
+proven server-side through finds, not through the reply. Fixture replies shape the wire,
+never claims about live counts.
+
+### S10 — the smoke leg is self-contained
+
+The live smoke drains the `docs` collection first (through the confirmed seam, tolerated on
+a clean start) and asserts `find 0` before seeding: an aborted earlier run leaves scratch
+documents in the long-lived container and every counting leg needs exact populations
+(observed live: a 12-document accumulation broke the surgical legs with "2/3/4 matched").
+
 ## Tasks
 
 | ID | Spec | Route | Status | Evidence |
@@ -136,6 +159,7 @@ plus the new `delete <collection> with <filter-text>` and
 | T5 | S6, S8 | inline | done | live on mongo 7.0 (`anydb-mongo` container): gate refusal verbatim, `insert 1` x3, `update docs: 1 matched, 1 modified` verified server-side (`find 1`), `delete docs: 1 document(s) removed` (`find 2`), `delete one` surgical leg (`delete docs: 1 document(s) removed`, `find 1`), final `delete docs: 1 document(s) removed`, `find 0` — throwaway `anydb-scrap` db, exit 0 |
 | T6 | all | inline | done | `cargo test --workspace` exit 0 (224 passed, 0 failed across all targets), `cargo clippy --workspace --all-targets -- -D warnings` exit 0, `cargo fmt`, `cargo deny check` (advisories/bans/licenses/sources ok) — on the tree of `0aba548` |
 | T7 | S7, S8 | inline | done | 3 new tests (29 in statement.rs, 227 workspace-wide, all gates exit 0), copy `delete one` live evidence into the T5 cell (its smoke leg ran on this increment's tree) |
+| T8 | S9, S10 | inline | done | 3 update-one tests (32 in statement.rs, 230 workspace-wide), gates all exit 0 (`fmt`/`clippy -D warnings`/`deny`); live smoke on mongo 7.0 ran the full surgical leg: drain 3 leftovers, `update one docs: 1 matched, 1 modified`, both server-side finds honest, exit 0 — commit (this unit) |
 
 ## Log
 
@@ -174,3 +198,16 @@ plus the new `delete <collection> with <filter-text>` and
   changes (0 stays default, 1 for the modifier); the acceptance contract (tag `delete <n>`,
   message shape) is unchanged, and the copy fills the same `message` field. The all-matching
   form remains byte-identical.
+- L9 (2026-10-19, iteration 3 = this unit; user ask "continuar con el pendiente"): the same
+  surgical treatment reaches the update surface: `update one ... set ...` -> wire
+  `multi: false`, everything else unchanged. While the live smoke grew the surgical leg, a
+  pre-existing fixture assert (reply (2,1) -> "2 matched, 1 modified") pinned a belief about
+  server semantics; two live experiments (raw wire + mongosh on mongo 7.0) refuted it — with
+  `multi:false` the server stops at the limit and reports `n: 1`. The fixture stays as a
+  wire-shape test with a corrected comment; the LIVE expectation is 1/1 with the surgical
+  behavior proven through server-side finds.
+- L10 (2026-10-19, evidence): counting legs of the live smoke are only exact against a clean
+  collection, and aborts leave seeds (a 12-document accumulation produced "2/3/4 matched"
+  across runs). The smoke now drains `docs` via the confirmed seam and asserts `find 0`
+  before seeding (S10); recorded with real evidence, the earlier "2 matched" live claim was
+  never observed and is corrected in the example header.
