@@ -35,8 +35,8 @@
 //! collection named `one` is not addressable) — and
 //! `"update <collection> with <filter-text> set <json-document>"`: the
 //! filter is required (a filter-less delete never parses), the update
-//! touches every match
-//! (`upsert: false, multi: true`) with the JSON update spec traveling
+//! touches every match by default (`upsert: false, multi: true`) or at
+//! most the first under `update one` (`multi: false`), with the JSON update spec traveling
 //! verbatim as `u`. Write results carry a legible acceptance message
 //! next to the tag/count ("delete coll: 1 document(s) removed",
 //! "update coll: 3 matched, 3 modified") — a destructive statement is
@@ -234,15 +234,22 @@ impl DeleteStatement {
     }
 }
 
-/// `update <collection> with <filter-text> set <json-document>`: the
-/// filter is REQUIRED and the JSON document is mongo's update spec
+/// `update [one] <collection> with <filter-text> set <json-document>`:
+/// the filter is REQUIRED and the JSON document is mongo's update spec
 /// (`u`) verbatim — an operator document (`{"$set": ...}`) applies
-/// fields, a plain document replaces the matches wholesale.
+/// fields, a plain document replaces the matches wholesale. `update one`
+/// touches at most the first matching document (`multi: false`); the
+/// plain form touches every match.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UpdateStatement {
     pub collection: String,
     filter: filter::Filter,
     document: bson::Document,
+    /// `update one <collection> with <filter> set <document>`: the
+    /// single-document form (wire `multi: false` — at most the first
+    /// matching document is touched). The plain form updates every
+    /// match (`multi: true`).
+    limit_one: bool,
 }
 
 impl UpdateStatement {
@@ -294,7 +301,7 @@ fn statement_protocol(message: String) -> ConnectionError {
 /// Parses `find <collection> [with <filter-text>]`,
 /// `insert <collection> with <json-document>`,
 /// `delete [one] <collection> with <filter-text>` and
-/// `update <collection> with <filter-text> set <json-document>` by
+/// `update [one] <collection> with <filter-text> set <json-document>` by
 /// slicing the raw SQL: the command word and collection are single
 /// tokens, everything after a standalone `with` is the verbatim filter
 /// text or the verbatim document text (the update splits on the first
@@ -303,7 +310,7 @@ fn statement_protocol(message: String) -> ConnectionError {
 fn parse_statement(sql: &str) -> Result<Statement, ConnectionError> {
     fn unsupported() -> ConnectionError {
         statement_protocol(
-            "mongo statements are 'find <collection> [with <filter>]', 'insert <collection> with <document>', 'delete [one] <collection> with <filter>' or 'update <collection> with <filter> set <document>'"
+            "mongo statements are 'find <collection> [with <filter>]', 'insert <collection> with <document>', 'delete [one] <collection> with <filter>' or 'update [one] <collection> with <filter> set <document>'"
                 .to_owned(),
         )
     }
@@ -316,12 +323,12 @@ fn parse_statement(sql: &str) -> Result<Statement, ConnectionError> {
     if command != "find" && command != "insert" && command != "delete" && command != "update" {
         return Err(unsupported());
     }
-    // `delete one ...`: a standalone `one` selects the single-document
-    // form. The token is RESERVED (the filter grammar's reserved
-    // leading `not` precedent): a collection named `one` is not
-    // addressable, and `delete one` without a collection after it
-    // answers the delete-one form hint.
-    let (tail, limit_one) = if command == "delete" {
+    // `delete one ...` / `update one ...`: a standalone `one` selects
+    // the single-document form. The token is RESERVED (the filter
+    // grammar's reserved leading `not` precedent): a collection named
+    // `one` is not addressable, and `one` without a collection after it
+    // answers the delete-one / update-one form hint.
+    let (tail, limit_one) = if command == "delete" || command == "update" {
         let head = head.trim_start();
         let (first, after) = match head.split_once(char::is_whitespace) {
             Some(split) => split,
@@ -329,9 +336,11 @@ fn parse_statement(sql: &str) -> Result<Statement, ConnectionError> {
         };
         if first == "one" {
             if after.trim().is_empty() {
-                return Err(statement_protocol(
-                    "delete one statements are 'delete one <collection> with <filter>'".to_owned(),
-                ));
+                return Err(if command == "delete" {
+                    delete_one_form_error()
+                } else {
+                    update_one_form_error()
+                });
             }
             (after.trim_start(), true)
         } else {
@@ -347,12 +356,10 @@ fn parse_statement(sql: &str) -> Result<Statement, ConnectionError> {
         None => (tail.trim_start(), ""),
     };
     if collection.is_empty() {
-        return Err(if limit_one {
-            statement_protocol(
-                "delete one statements are 'delete one <collection> with <filter>'".to_owned(),
-            )
-        } else {
-            unsupported()
+        return Err(match (limit_one, command) {
+            (true, "delete") => delete_one_form_error(),
+            (true, "update") => update_one_form_error(),
+            _ => unsupported(),
         });
     }
     if collection.starts_with('$') {
@@ -383,16 +390,7 @@ fn parse_statement(sql: &str) -> Result<Statement, ConnectionError> {
         }
         "delete" => {
             if remainder.is_empty() {
-                return Err(if limit_one {
-                    statement_protocol(
-                        "delete one statements are 'delete one <collection> with <filter>'"
-                            .to_owned(),
-                    )
-                } else {
-                    statement_protocol(
-                        "delete statements are 'delete <collection> with <filter>'".to_owned(),
-                    )
-                });
+                return Err(delete_form_error(limit_one));
             }
             // A delete always carries the compiled filter: a filter-less
             // delete would match everything, so that shape is never a
@@ -408,16 +406,16 @@ fn parse_statement(sql: &str) -> Result<Statement, ConnectionError> {
         }
         "update" => {
             if remainder.is_empty() {
-                return Err(update_form_error());
+                return Err(update_form_error(limit_one));
             }
             let tail = parts.next().unwrap_or_default().trim_start();
             // Quote-aware scan: the real `set` separator is the first
             // whitespace-standalone `set` outside both quote kinds.
             let Some((filter_text, document_text)) = update_split(tail) else {
-                return Err(update_form_error());
+                return Err(update_form_error(limit_one));
             };
             if filter_text.trim().is_empty() || document_text.trim().is_empty() {
-                return Err(update_form_error());
+                return Err(update_form_error(limit_one));
             }
             let filter = filter::parse_filter(filter_text.trim())?;
             let document = document::parse_document_literal(document_text, "update")?;
@@ -425,6 +423,7 @@ fn parse_statement(sql: &str) -> Result<Statement, ConnectionError> {
                 collection: collection.to_owned(),
                 filter,
                 document,
+                limit_one,
             }))
         }
         _ => {
@@ -502,9 +501,42 @@ fn update_split(tail: &str) -> Option<(&str, &str)> {
 
 /// The update form hint, raised for every shape that does not reach a
 /// parsed `update ... with <filter> set <json-document>`.
-fn update_form_error() -> ConnectionError {
+fn update_form_error(limit_one: bool) -> ConnectionError {
     statement_protocol(
-        "update statements are 'update <collection> with <filter> set <document>'".to_owned(),
+        if limit_one {
+            "update one statements are 'update one <collection> with <filter> set <document>'"
+        } else {
+            "update statements are 'update <collection> with <filter> set <document>'"
+        }
+        .to_owned(),
+    )
+}
+
+/// The delete one form hint, raised for `one` without a collection.
+fn delete_one_form_error() -> ConnectionError {
+    statement_protocol(
+        "delete one statements are 'delete one <collection> with <filter>'".to_owned(),
+    )
+}
+
+/// The update one form hint, raised for `one` without a collection.
+fn update_one_form_error() -> ConnectionError {
+    statement_protocol(
+        "update one statements are 'update one <collection> with <filter> set <document>'"
+            .to_owned(),
+    )
+}
+
+/// The delete form hint, raised for every shape that does not reach a
+/// parsed `delete ... with <filter>`.
+fn delete_form_error(limit_one: bool) -> ConnectionError {
+    statement_protocol(
+        if limit_one {
+            "delete one statements are 'delete one <collection> with <filter>'"
+        } else {
+            "delete statements are 'delete <collection> with <filter>'"
+        }
+        .to_owned(),
     )
 }
 
@@ -623,9 +655,10 @@ impl WireDataSource {
     }
 
     /// Typed update core: filter compiles and binds first; the JSON
-    /// update spec travels verbatim as `u` (upsert off, multi on — SQL
-    /// UPDATE semantics). The acceptance reports matched and modified
-    /// counts separately, in words.
+    /// update spec travels verbatim as `u` (upsert off; multi on for the
+    /// plain form — SQL UPDATE semantics — and off for `update one`,
+    /// which touches at most the first match). The acceptance reports
+    /// matched and modified counts separately, in words.
     async fn update_typed(
         &self,
         statement: &UpdateStatement,
@@ -637,7 +670,12 @@ impl WireDataSource {
             return Err(ConnectionError::DriverFailure);
         };
         let (matched, modified) = connection
-            .update(&statement.collection, &filter, &statement.document)
+            .update(
+                &statement.collection,
+                &filter,
+                &statement.document,
+                !statement.limit_one,
+            )
             .await?;
         Ok(TypedStatementResult {
             columns: Vec::new(),

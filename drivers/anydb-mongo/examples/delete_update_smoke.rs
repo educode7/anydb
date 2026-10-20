@@ -8,22 +8,31 @@
 //!
 //! 1. the UNCONFIRMED gate: the ordinary typed surface refuses a delete
 //!    naming the confirmed seam, client-side;
-//! 2. seed three documents through the driver's own `insert`;
-//! 3. `update ... set {"$set": ...}` — "matched / modified" acceptance,
+//! 2. DRAIN: previous runs (aborted mid-leg) leave their scratch
+//!    documents behind, so the live leg first removes everything from
+//!    the collection through the confirmed seam and asserts `find 0`;
+//! 3. seed three documents through the driver's own `insert`;
+//! 4. `update ... set {"$set": ...}` — "matched / modified" acceptance,
 //!    verified back through a find;
-//! 4. `delete` through the confirmed seam — "document(s) removed"
+//! 5. `update one` — the surgical update touches the FIRST of two
+//!    matches; a live mongod stops at the limit and the reply reports
+//!    n = 1 ("1 matched, 1 modified"), verified server-side;
+//! 6. `delete` through the confirmed seam — "document(s) removed"
 //!    acceptance, counts asserted after each leg;
-//! 5. `delete one` — the surgical leg removes exactly one of the two
+//! 7. `delete one` — the surgical leg removes exactly one of the two
 //!    survivors, verified server-side;
-//! 6. the collection ends EMPTY (all-matching deletion + `find 0`).
+//! 8. the collection ends EMPTY (all-matching deletion + `find 0`).
 //!
 //! Non-zero exit means a failed statement or a failed assertion.
 //!
 //! Live evidence (mongo 7.0 container `anydb-mongo`): gate refusal
-//! `delete statements are destructive ...`, `insert 1` x3, `update docs:
-//! 1 matched, 1 modified`, `find 1`, `delete docs: 1 document(s)
-//! removed`, `find 2`, `delete one docs: 1 document(s) removed`,
-//! `find 1`, `delete docs: 1 document(s) removed`, `find 0`.
+//! `delete statements are destructive ...`, insert `1` x3, `update docs:
+//! 1 matched, 1 modified`, `find 1`, `update one docs: 1 matched, 1
+//! modified` (the reply n counts the document the limit let through;
+//! the surgical clip is verified server-side), `find 1` twice,
+//! `delete docs: 1 document(s) removed`, `find 2`,
+//! `delete one docs: 1 document(s) removed`, `find 1`,
+//! `delete docs: 1 document(s) removed`, `find 0`.
 
 use anydb_mongo::MongoDriver;
 use anydb_shared::driver::spi::{DataSource as _, DataSourceMetadata, OpenRequest};
@@ -71,7 +80,26 @@ async fn main() {
     );
     println!("separator gate ok: {message}");
 
-    // 2) Seed three documents through the driver's own insert surface.
+    // 2) DRAIN: an aborted earlier run leaves its scratch documents in
+    //    the (long-lived) container, and every counting leg below needs
+    //    exact populations. Remove everything through the confirmed
+    //    seam and assert the collection is empty before seeding.
+    let typed = source
+        .execute_statement_typed_confirmed("delete docs with n >= 0", &[])
+        .await
+        .expect("the drain runs through the confirmed seam");
+    let drain_removed = typed.affected_rows.unwrap_or(0);
+    if drain_removed > 0 {
+        println!("drain removed {drain_removed} leftover document(s)");
+    }
+    let typed = source
+        .execute_statement_typed("find docs with n >= 0", &[])
+        .await
+        .expect("verify the drain");
+    assert_eq!(typed.command_tag, Some("find 0".to_owned()));
+    println!("drain ok: collection empty");
+
+    // 3) Seed three documents through the driver's own insert surface.
     for (n, tag) in [(1, "smoke-a"), (2, "smoke-b"), (3, "smoke-c")] {
         let typed = source
             .execute_statement_typed(
@@ -106,7 +134,37 @@ async fn main() {
     assert_eq!(typed.command_tag, Some("find 1".to_owned()));
     println!("update verified server-side: find 1");
 
-    // 4) Delete one match through the confirmed seam.
+    // 5) THE SURGICAL UPDATE LEG: `update one` touches at most the
+    //    first match even when the filter matches two. A live mongod
+    //    stops at the limit, so the reply reports n = 1 (the document
+    //    it processed) — the surgical behavior itself is verified
+    //    server-side through the finds below, not through the reply.
+    let typed = source
+        .execute_statement_typed(
+            r#"update one docs with smoked = false set {"$set": {"n": 22}}"#,
+            &[],
+        )
+        .await
+        .expect("the single-document update executes from the ordinary path");
+    assert_eq!(typed.command_tag, Some("update 1".to_owned()));
+    let surgical_update = typed.message.expect("update one acceptance");
+    assert_eq!(surgical_update, "update docs: 1 matched, 1 modified");
+    println!("acceptance (update one): {surgical_update}");
+
+    // Exactly the first match got `n: 22` and its sibling kept `n: 3`.
+    let typed = source
+        .execute_statement_typed("find docs with n = 22", &[])
+        .await
+        .expect("verify the surgical update applied");
+    assert_eq!(typed.command_tag, Some("find 1".to_owned()));
+    let typed = source
+        .execute_statement_typed("find docs with tag = 'smoke-c' and n = 3", &[])
+        .await
+        .expect("verify the survivor was untouched");
+    assert_eq!(typed.command_tag, Some("find 1".to_owned()));
+    println!("update one verified server-side: find 1 and the survivor intact");
+
+    // 5) Delete one match through the confirmed seam.
     let typed = source
         .execute_statement_typed_confirmed("delete docs with n = 1", &[])
         .await
@@ -124,8 +182,8 @@ async fn main() {
     assert_eq!(typed.command_tag, Some("find 2".to_owned()));
     println!("delete verified server-side: find 2");
 
-    // 5) THE SURGICAL LEG: the single-document form removes exactly
-    //    one of the two survivors, and the acceptance says so.
+    // 6) THE SURGICAL DELETE LEG: the single-document form removes
+    //    exactly one of the two survivors, and the acceptance says so.
     let typed = source
         .execute_statement_typed_confirmed("delete one docs with tag = 'smoke-b'", &[])
         .await
@@ -143,7 +201,7 @@ async fn main() {
     assert_eq!(typed.command_tag, Some("find 1".to_owned()));
     println!("delete one verified server-side: find 1");
 
-    // 6) The last survivor goes the same all-matching way; the
+    // 7) The last survivor goes the same all-matching way; the
     //    acceptance reports the honest count (one, after the surgical
     //    leg already took its document).
     let typed = source

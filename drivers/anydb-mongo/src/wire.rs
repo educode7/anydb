@@ -589,8 +589,10 @@ impl Connection {
     /// `update` command: the compiled filter as the one query selector,
     /// the JSON statement document as mongo's update spec (`u`) VERBATIM
     /// (operator document applies fields; a plain document replaces the
-    /// matches wholesale), `multi: true` (SQL UPDATE semantics) and
-    /// `upsert: false` (no filter miss mints documents), one round-trip.
+    /// matches wholesale), `multi: false` touches at most the first
+    /// matching document (`update one`) while `multi: true` touches
+    /// every match (SQL UPDATE semantics), `upsert: false` (no filter
+    /// miss mints documents), one round-trip.
     /// Returns the matched (`n`) and modified (`nModified`) counts;
     /// `writeErrors` and either missing count surface as failures.
     pub async fn update(
@@ -598,6 +600,7 @@ impl Connection {
         collection: &str,
         filter: &Document,
         update: &Document,
+        multi: bool,
     ) -> Result<(i64, i64), ConnectionError> {
         let command = Document::from(vec![
             ("update".to_owned(), Bson::String(collection.to_owned())),
@@ -607,7 +610,7 @@ impl Connection {
                     ("q".to_owned(), Bson::Document(filter.clone())),
                     ("u".to_owned(), Bson::Document(update.clone())),
                     ("upsert".to_owned(), Bson::Boolean(false)),
-                    ("multi".to_owned(), Bson::Boolean(true)),
+                    ("multi".to_owned(), Bson::Boolean(multi)),
                 ]))]),
             ),
         ]);

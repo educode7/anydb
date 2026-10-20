@@ -1021,7 +1021,7 @@ async fn insert_failures_never_reach_the_wire() {
         .expect_err("missing collection");
     assert!(protocol_error(
         error,
-        "mongo statements are 'find <collection> [with <filter>]', 'insert <collection> with <document>', 'delete [one] <collection> with <filter>' or 'update <collection> with <filter> set <document>'"
+        "mongo statements are 'find <collection> [with <filter>]', 'insert <collection> with <document>', 'delete [one] <collection> with <filter>' or 'update [one] <collection> with <filter> set <document>'"
     ));
 
     // The handshake-only server answers `ok: 0` to any command it does
@@ -1102,12 +1102,14 @@ async fn delete_server(
 }
 
 /// Handshake + exactly one `update` command: asserts the update spec
-/// (`u`) travels verbatim with `upsert: false, multi: true` and the
+/// (`u`) travels verbatim with `upsert: false` and the statement's
+/// `multi` flag (`true` all-matching, `false` single-document) plus the
 /// compiled filter as the only selector, then replies.
 async fn update_server(
     stream: TcpStream,
     expected_filter: Document,
     expected_update: Document,
+    expected_multi: bool,
     reply: Document,
 ) {
     let mut stream = stream;
@@ -1127,10 +1129,10 @@ async fn update_server(
             ("q".to_owned(), Bson::Document(expected_filter)),
             ("u".to_owned(), Bson::Document(expected_update)),
             ("upsert".to_owned(), Bson::Boolean(false)),
-            ("multi".to_owned(), Bson::Boolean(true)),
+            ("multi".to_owned(), Bson::Boolean(expected_multi)),
         ])]),
         "updates carries the statement's filter and update spec \
-         with the all-matching, never-upserting flags"
+         with the never-upserting flag and the statement's multi"
     );
     assert_eq!(
         field(&command, "$db"),
@@ -1272,7 +1274,13 @@ async fn update_applies_the_update_spec_and_says_what_it_touched() {
         Bson::Document(vec![("flag".to_owned(), int32(1))]),
     )];
     let (port, server) = spawn_server(move |stream| {
-        update_server(stream, expected_filter, expected_update, update_reply(1, 1))
+        update_server(
+            stream,
+            expected_filter,
+            expected_update,
+            true,
+            update_reply(1, 1),
+        )
     });
     let source = source_for(port).await;
 
@@ -1322,7 +1330,13 @@ async fn the_set_separator_never_splits_quoted_filter_values() {
             Bson::Document(vec![("a".to_owned(), int32(1))]),
         )];
         let (port, server) = spawn_server(move |stream| {
-            update_server(stream, expected_filter, expected_update, update_reply(1, 1))
+            update_server(
+                stream,
+                expected_filter,
+                expected_update,
+                true,
+                update_reply(1, 1),
+            )
         });
         let source = source_for(port).await;
         let typed = source
@@ -1342,7 +1356,13 @@ async fn a_bound_update_filters_with_the_parameter() {
         Bson::Document(vec![("flag".to_owned(), int32(1))]),
     )];
     let (port, server) = spawn_server(move |stream| {
-        update_server(stream, expected_filter, expected_update, update_reply(2, 2))
+        update_server(
+            stream,
+            expected_filter,
+            expected_update,
+            true,
+            update_reply(2, 2),
+        )
     });
     let source = source_for(port).await;
 
@@ -1433,8 +1453,9 @@ async fn update_write_errors_stay_errors() {
         "$set".to_owned(),
         Bson::Document(vec![("flag".to_owned(), int32(1))]),
     )];
-    let (port, server) =
-        spawn_server(move |stream| update_server(stream, expected_filter, expected_update, reply));
+    let (port, server) = spawn_server(move |stream| {
+        update_server(stream, expected_filter, expected_update, true, reply)
+    });
     let source = source_for(port).await;
 
     let error = source
@@ -1466,8 +1487,9 @@ async fn an_update_reply_without_its_modified_count_is_a_protocol_error() {
         "$set".to_owned(),
         Bson::Document(vec![("flag".to_owned(), int32(1))]),
     )];
-    let (port, server) =
-        spawn_server(move |stream| update_server(stream, expected_filter, expected_update, reply));
+    let (port, server) = spawn_server(move |stream| {
+        update_server(stream, expected_filter, expected_update, true, reply)
+    });
     let source = source_for(port).await;
 
     let error = source
@@ -1580,6 +1602,126 @@ async fn delete_one_shapes_beyond_the_wire_never_reach_it() {
         protocol_error(error, "delete statements are destructive"),
         "the confirmed seam rules every delete form"
     );
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn update_one_touches_at_most_the_first_match_and_says_so() {
+    let expected_filter = vec![("n".to_owned(), int32(2))];
+    let expected_update = vec![(
+        "$set".to_owned(),
+        Bson::Document(vec![("flag".to_owned(), int32(1))]),
+    )];
+    let (port, server) = spawn_server(move |stream| {
+        update_server(
+            stream,
+            expected_filter,
+            expected_update,
+            false,
+            update_reply(1, 1),
+        )
+    });
+    let source = source_for(port).await;
+
+    // `update one` is reachable from the ORDINARY path: the gate is
+    // scoped to delete only.
+    let typed = source
+        .execute_statement_typed(
+            r#"update one components with n = 2 set {"$set": {"flag": 1}}"#,
+            &[],
+        )
+        .await
+        .expect("the single-document update executes from the ordinary path");
+    assert!(typed.columns.is_empty(), "an update yields no columns");
+    assert!(typed.rows.is_empty(), "an update yields no rows");
+    assert_eq!(typed.command_tag, Some("update 1".to_owned()));
+    assert_eq!(typed.affected_rows, Some(1));
+    assert_eq!(
+        typed.message,
+        Some("update components: 1 matched, 1 modified".to_owned())
+    );
+
+    server.await.expect("server task");
+}
+
+#[tokio::test]
+async fn update_one_wire_multi_flips_but_nothing_else_changes() {
+    // Same filter compilation and same `u` contract as the plain form:
+    // only `multi` goes false. The driver renders whatever counts the
+    // reply carries, verbatim — the (2, 1) reply here is a wire-format
+    // fixture, not a live-semantics claim: a live mongod stops at the
+    // limit and reports n = 1 for a two-match filter (see the live
+    // smoke's surgical leg).
+    let expected_filter = vec![("n".to_owned(), int32(2))];
+    let expected_update = vec![(
+        "$set".to_owned(),
+        Bson::Document(vec![("flag".to_owned(), int32(1))]),
+    )];
+    let (port, server) = spawn_server(move |stream| {
+        update_server(
+            stream,
+            expected_filter,
+            expected_update,
+            false,
+            update_reply(2, 1),
+        )
+    });
+    let source = source_for(port).await;
+
+    let typed = source
+        .execute_statement_typed(
+            r#"update one components with n = 2 set {"$set": {"flag": 1}}"#,
+            &[],
+        )
+        .await
+        .expect("the single-document update executes");
+    assert_eq!(
+        typed.message,
+        Some("update components: 2 matched, 1 modified".to_owned()),
+        "the reply counts render verbatim; no fields are dropped or renamed"
+    );
+
+    server.await.expect("server task");
+}
+
+#[tokio::test]
+async fn update_one_shapes_beyond_the_wire_never_reach_it() {
+    let (port, server) = spawn_server(handshake_only_server);
+    let source = source_for(port).await;
+
+    // `update one` alone: no collection after the reserved modifier.
+    let error = source
+        .execute_statement_typed("update one", &[])
+        .await
+        .expect_err("the modifier without a collection is not a statement");
+    assert!(protocol_error(
+        error,
+        "update one statements are 'update one <collection> with <filter> set <document>'"
+    ));
+
+    // A collection but no `set` clause: the update-one hint.
+    let error = source
+        .execute_statement_typed("update one components", &[])
+        .await
+        .expect_err("the single-document form requires its set clause too");
+    assert!(protocol_error(
+        error,
+        "update one statements are 'update one <collection> with <filter> set <document>'"
+    ));
+
+    // Filter requires the same arity contract as the plain form.
+    let error = source
+        .execute_statement_typed(
+            r#"update one components with n = ? set {"$set": {"a": 1}}"#,
+            &[],
+        )
+        .await
+        .expect_err("the update document binds nothing");
+    assert!(protocol_error(
+        error,
+        "statement expects 1 parameter(s), got 0"
+    ));
 
     drop(server);
 }
