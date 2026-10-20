@@ -111,3 +111,12 @@ splitting them yields commits that do not compile. Test runner: `cargo test --wo
   public contract change, no concurrency change to existing code, no delivery path; the new
   bin is additive. Verification: own checks only (focused test + workspace suite + clippy +
   fmt + deny-local), no independent verifier needed per the Risk line. No push (human).
+- L6 (delivery, user verbatim): "unificar a main". Merged `feature/gui-iced` into `main`
+  as `7e87f60` "merge the iced desktop GUI feature branch" (merge commit amended in place:
+  the merge needed one compile adaptation and the commit is local-only). The mongo vertical
+  on main added `TypedStatementResult.message`, so the merge adapted the worker fake
+  (`message: None`) and the screen's summary line now appends `message` when present —
+  exactly what S4 already specified ("delete <collection>: <n> document(s) removed").
+  Gates on the merged tree: fmt 0, clippy workspace -D warnings 0, `cargo test --workspace`
+  0 failures, deny licenses+bans+sources ok (advisories still network-blocked). Push remains
+  a human decision.
