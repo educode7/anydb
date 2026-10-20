@@ -53,6 +53,9 @@ name = "anydb-desktop"
 version = "0.1.0"
 dependencies = [
  "anydb",
+ "anydb-mongo",
+ "anydb-postgres",
+ "async-trait",
  "iced",
  "tokio",
 ]
